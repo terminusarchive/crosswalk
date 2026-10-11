@@ -2,8 +2,8 @@
 name = "crosswalk"
 version = "1.1.2"
 edition = "2024"
-description = "A TUI network overview for Linux with 25 bundled themes"
-keywords = ["network", "tui", "monitoring", "firewall", "bandwidth"]
+description = "A network monitoring&overview TUI for Linux with 25 bundled themes"
+keywords = ["network", "tui", "monitoring", "firewall", "linux"]
 categories = ["command-line-utilities", "network-programming"]
 license = "MIT"
 repository = "https://github.com/terminusarchive/crosswalk"
