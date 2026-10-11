@@ -1,10 +1,18 @@
 # Crosswalk
 
-Crosswalk is a read-only terminal dashboard for your network on Linux. It shows bandwidth, which apps send data where, which ports listen and whether UFW lets traffic reach them, what the firewall blocked, and which machines and Wi-Fi networks are near. It never changes firewall rules and never writes traffic history to disk.
+Crosswalk shows what your Linux machine is doing on the network, live, in one terminal window.
 
-![Crosswalk's two pages: Traffic, and Network & Firewall](docs/screenshot.png)
+See how much bandwidth you are using, which apps are talking to which hosts, which ports are open and whether UFW lets traffic reach them, what the firewall has blocked, and which machines and Wi-Fi networks are nearby. Switch between 25 built-in themes with one key.
 
-The screenshot uses made-up data.
+Crosswalk only watches. It never changes a firewall rule and never writes traffic history to disk.
+
+![The Traffic page: bandwidth, App Traffic, Listening Ports and Firewall Rules](docs/screenshot-traffic.png)
+
+![The Network & Firewall page: Firewall Blocks, Network Events, Wi-Fi Networks and Neighbors](docs/screenshot-network-firewall.png)
+
+![The network map, opened with m](docs/screenshot-map.png)
+
+The screenshots use made-up data, in the synthwave, tokyo-night and catppuccin themes.
 
 ## Requirements
 
@@ -17,25 +25,27 @@ The screenshot uses made-up data.
 
 Tested with Arch Linux (Linux 7.2.9), Rust 1.98.1, libpcap 1.11.0, UFW 0.36.2, NetworkManager 1.58.1, iproute2 7.2.0 and systemd 262. Other versions may work but have not been tried.
 
-## Build and run
+## Install
+
+```sh
+cargo install crosswalk
+sudo ~/.cargo/bin/crosswalk
+```
+
+`cargo install` builds the release binary into `~/.cargo/bin/crosswalk`. Run it by its full path, because `sudo` does not search `~/.cargo/bin`. After the `setcap` grant below, plain `crosswalk` works.
+
+Remove it with `cargo uninstall crosswalk`. An installed copy has no capabilities, so grant them again after every install.
+
+To build from a clone:
 
 ```sh
 git clone https://github.com/terminusarchive/crosswalk
 cd crosswalk
 cargo build --release
-./target/release/crosswalk --help
 sudo ./target/release/crosswalk
 ```
 
 Use `--config config.example.toml` for a configuration file. Command-line options override the file. The terminal must be at least 110 columns by 24 rows.
-
-To install into `~/.cargo/bin`:
-
-```sh
-cargo install --path .
-```
-
-Remove it with `cargo uninstall crosswalk`. An installed copy has no capabilities, so grant them again after every install.
 
 ## Running without sudo
 

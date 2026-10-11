@@ -1150,12 +1150,12 @@ mod overview {
         let theme = Theme::default();
         let columns = blocked_zoom_columns();
         let rows: Vec<Row> = Vec::new();
-        for width in [5u16, 10, 20, 30] {
+        for width in [10u16, 20, 30] {
             let area = ratatui::layout::Rect::new(0, 0, width, 2);
             let mut buffer = ratatui::buffer::Buffer::empty(area);
             Table::new(&columns, &rows, &theme).render(&mut buffer, area);
             let header: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
-            assert!(header.contains("LAST"), "{width}: {header:?}");
+            assert!(header.contains("LAST SEEN"), "{width}: {header:?}");
         }
     }
 
@@ -2610,8 +2610,8 @@ mod overview {
         for visible in [
             "APP TRAFFIC",
             "PID",
-            "↓ RATE",
-            "↑ RATE",
+            "↓ IN",
+            "↑ OUT",
             "↓ TOTAL",
             "↑ TOTAL",
             "142.250.80.46",
@@ -2630,7 +2630,16 @@ mod overview {
     fn blocked_zoom_adds_first_seen_interface_direction_and_outbound_blocks() {
         let (_, _, text) = zoomed('5', 120, 32);
         for visible in [
-            "LAST", "FIRST", "FROM", "PORT", "HITS", "IFACE", "DIR", "eth0", "10.0.0.5", " in ",
+            "LAST SEEN",
+            "FIRST SEEN",
+            "FROM",
+            "PORT",
+            "HITS",
+            "INTERFACE",
+            "DIRECTION",
+            "eth0",
+            "10.0.0.5",
+            " in ",
             " out ",
         ] {
             assert!(text.contains(visible), "missing {visible:?}:\n{text}");
@@ -2752,8 +2761,8 @@ mod overview {
         for visible in [
             "wlan0",
             "lo",
-            "↓ RATE",
-            "↑ RATE",
+            "↓ IN",
+            "↑ OUT",
             "↓ TOTAL",
             "↑ TOTAL",
             "▶",
@@ -3636,8 +3645,8 @@ mod overview {
             );
         }
         assert!(
-            network.iter().any(|l| l.contains("│ LAST")),
-            "missing the LAST header:\n{}",
+            network.iter().any(|l| l.contains("│ LAST SEEN")),
+            "missing the LAST SEEN header:\n{}",
             network.join("\n")
         );
         for text in [&traffic, &network] {
@@ -3663,11 +3672,11 @@ mod overview {
         let network = lines(&draw_net(&state, 110, 24));
         let joined = [text.clone(), network.clone()].concat().join("\n");
         let header = text.iter().find(|l| l.contains("DESTINATION")).unwrap();
-        for col in ["APP", "DESTINATION", "PORT", "↓ RATE", "↑ RATE"] {
+        for col in ["APP", "DESTINATION", "PORT", "↓ IN", "↑ OUT"] {
             assert!(header.contains(col), "{col}: {header}");
         }
         let blocked = network.iter().find(|l| l.contains("FROM")).unwrap();
-        for col in ["LAST", "FROM", "PORT", "HITS", "KIND"] {
+        for col in ["LAST SEEN", "FROM", "PORT", "HITS", "KIND"] {
             assert!(blocked.contains(col), "{col}: {blocked}");
         }
         assert!(joined.contains("255.255.255.255"), "{joined}");
@@ -3686,7 +3695,7 @@ mod overview {
         refuse(&mut state, 2, "203.0.113.200");
         let text = lines(&draw_net(&state, 110, 24));
         let header = text.iter().find(|l| l.contains("FROM")).unwrap();
-        for col in ["LAST", "FROM", "PORT", "HITS", "KIND"] {
+        for col in ["LAST SEEN", "FROM", "PORT", "HITS", "KIND"] {
             assert!(header.contains(col), "{col}: {header}");
         }
         for (address, kind) in [("198.51.100.123", "blocked"), ("203.0.113.200", "refused")] {
@@ -4454,10 +4463,10 @@ mod overview {
 
     #[test]
     fn firewall_blocks_give_the_source_name_all_the_room_the_other_columns_leave() {
-        // 51 cells less LAST 5, PORT 8, HITS 4, KIND 7 and four gaps is 23.
-        let whole = format!("{}.example.org", "b".repeat(11));
-        assert_eq!(whole.len(), 23);
-        let cut = format!("{}.example.org", "c".repeat(12));
+        // 51 cells less LAST SEEN 9, PORT 8, HITS 4, KIND 7 and four gaps is 19.
+        let whole = format!("{}.example.org", "b".repeat(7));
+        assert_eq!(whole.len(), 19);
+        let cut = format!("{}.example.org", "c".repeat(8));
         let mut state = bare();
         for (ip, port) in [("203.0.113.50", 3389), ("198.51.100.7", 22)] {
             for _ in 0..120 {
@@ -4473,10 +4482,7 @@ mod overview {
         let a = line_with(&text, "3389/tcp");
         let b = line_with(&text, "22/tcp");
         assert!(a.contains(&format!("{whole} 3389/tcp")), "{a}");
-        assert!(
-            b.contains("ccccccccccc.example.o…") || b.contains('…'),
-            "{b}"
-        );
+        assert!(b.contains("cccccccc.example.o…") || b.contains('…'), "{b}");
         for row in [a, b] {
             assert!(row.contains("×120 blocked │"), "{row}");
             assert_eq!(col(row, "×120") + 4, col(header, "HITS") + 4);
@@ -4607,7 +4613,7 @@ mod overview {
             );
             assert_eq!(
                 col(header, "ACTION"),
-                end(header, "DIR") + 1,
+                end(header, if zoomed { "DIRECTION" } else { "DIR" }) + 1,
                 "{zoomed} {header}"
             );
             if !zoomed {
@@ -4660,11 +4666,19 @@ mod overview {
         press(&mut i, &state, KeyCode::Enter);
         let text = text_of(&screen(&state, &mut i, None, 110, 24));
         let header = line_with(&text, "REMOTE");
-        let at: Vec<usize> = ["IFACE", "APP", "DIR", "ACTION", "PORT", "REMOTE", "RULE"]
-            .iter()
-            .map(|t| col(header, t))
-            .collect();
-        assert_eq!(at, [2, 8, 13, 17, 28, 40, 47], "{header}");
+        let at: Vec<usize> = [
+            "INTERFACE",
+            "APP",
+            "DIRECTION",
+            "ACTION",
+            "PORT",
+            "REMOTE",
+            "RULE",
+        ]
+        .iter()
+        .map(|t| col(header, t))
+        .collect();
+        assert_eq!(at, [2, 12, 17, 27, 38, 50, 57], "{header}");
     }
 
     #[test]
@@ -4818,7 +4832,15 @@ mod overview {
         let text = text_of(&screen(&state, &mut i, None, 110, 24));
         let header = line_with(&text, "REMOTE");
         let r1 = line_with(&text, "ZZ first text");
-        let order = ["IFACE", "APP", "DIR", "ACTION", "PORT", "REMOTE", "RULE"];
+        let order = [
+            "INTERFACE",
+            "APP",
+            "DIRECTION",
+            "ACTION",
+            "PORT",
+            "REMOTE",
+            "RULE",
+        ];
         for pair in order.windows(2) {
             assert!(col(header, pair[0]) < col(header, pair[1]), "{header}");
         }
@@ -4873,13 +4895,21 @@ mod overview {
         let header = line_with(&text, "REMOTE");
         let r1 = line_with(&text, "ZZ first text");
         let r2 = line_with(&text, "ZZ second text");
-        let order = ["IFACE", "APP", "DIR", "ACTION", "PORT", "REMOTE", "RULE"];
+        let order = [
+            "INTERFACE",
+            "APP",
+            "DIRECTION",
+            "ACTION",
+            "PORT",
+            "REMOTE",
+            "RULE",
+        ];
         for pair in order.windows(2) {
             assert!(col(header, pair[0]) < col(header, pair[1]), "{header}");
         }
-        assert_eq!(col(r1, "wlan0"), col(header, "IFACE"), "{r1}");
-        assert_eq!(col(r2, "all"), col(header, "IFACE"), "{r2}");
-        assert_eq!(col(r1, " in ") + 1, col(header, "DIR"), "{r1}");
+        assert_eq!(col(r1, "wlan0"), col(header, "INTERFACE"), "{r1}");
+        assert_eq!(col(r2, "all"), col(header, "INTERFACE"), "{r2}");
+        assert_eq!(col(r1, " in ") + 1, col(header, "DIRECTION"), "{r1}");
         assert_eq!(end(r1, "deny"), end(header, "ACTION"), "{r1}");
         assert_eq!(end(r2, "limit"), end(header, "ACTION"), "{r2}");
         assert_eq!(end(r1, "22/tcp"), end(header, "PORT"), "{r1}");
@@ -4904,7 +4934,7 @@ mod overview {
             assert!(pane[1].contains(title), "{title}: {pane:?}");
         }
         let blocks = line_with(&net, "KIND");
-        for title in ["LAST", "FROM", "PORT", "HITS", "KIND"] {
+        for title in ["LAST SEEN", "FROM", "PORT", "HITS", "KIND"] {
             assert!(blocks.contains(title), "{title}: {blocks}");
         }
         // The Bandwidth zoom's interface table.
@@ -4913,7 +4943,7 @@ mod overview {
         press(&mut i, &state, KeyCode::Enter);
         let text = text_of(&screen(&state, &mut i, None, 110, 24));
         let header = line_with(&text, "INTERFACE");
-        for title in ["↓ RATE", "↑ RATE", "↓ TOTAL", "↑ TOTAL"] {
+        for title in ["↓ IN", "↑ OUT", "↓ TOTAL", "↑ TOTAL"] {
             assert!(header.contains(title), "{title}: {header}");
         }
         assert!(header.ends_with("↑ TOTAL │"), "{header}");
@@ -5293,10 +5323,10 @@ mod overview {
         for (rows, columns) in [
             (
                 &apps,
-                vec!["APP", "DESTINATION", "PORT", "↓ RATE", "↑ RATE", "TOTAL"],
+                vec!["APP", "DESTINATION", "PORT", "↓ IN", "↑ OUT", "TOTAL"],
             ),
             (&ports, vec!["PORT", "APP", "BIND", "FIREWALL"]),
-            (&blocks, vec!["LAST", "FROM", "PORT", "HITS", "KIND"]),
+            (&blocks, vec!["LAST SEEN", "FROM", "PORT", "HITS", "KIND"]),
             (&neighbors, vec!["ADDRESS", "MAC"]),
         ] {
             for column in columns {
@@ -5462,7 +5492,14 @@ mod overview {
             .collect();
         assert_eq!(
             titles,
-            ["NETWORK", "SIGNAL", "SECURITY", "BSSID", "FREQ", "CHANNEL"],
+            [
+                "NETWORK",
+                "SIGNAL",
+                "SECURITY",
+                "BSSID",
+                "FREQUENCY",
+                "CHANNEL"
+            ],
             "{header}"
         );
     }
@@ -5557,7 +5594,7 @@ mod overview {
         assert!(line_with(&text, "Cafe").contains("6 · 2.4G"), "{text}");
         assert!(line_with(&text, "(hidden)").contains("197 · 6G"), "{text}");
         assert!(
-            line_with(&text, "FREQ")
+            line_with(&text, "FREQUENCY")
                 .trim_end_matches('│')
                 .trim_end()
                 .ends_with("CHANNEL"),
@@ -5627,7 +5664,10 @@ mod overview {
         press(&mut i, &state, KeyCode::Char('7'));
         press(&mut i, &state, KeyCode::Enter);
         let text = text_of(&screen(&state, &mut i, None, 110, 24));
-        assert!(text.contains("BSSID") && text.contains("FREQ"), "{text}");
+        assert!(
+            text.contains("BSSID") && text.contains("FREQUENCY"),
+            "{text}"
+        );
         let den_ap = line_with(&text, "Den AP");
         assert!(
             den_ap.contains("00:11:22:33:44:A1") && den_ap.contains("5805 MHz"),
@@ -6061,8 +6101,8 @@ mod overview {
             "PID",
             "DESTINATION",
             "PORT",
-            "↓ RATE",
-            "↑ RATE",
+            "↓ IN",
+            "↑ OUT",
             "TOTAL",
         ];
         let at: Vec<usize> = order.iter().map(|c| col(header, c)).collect();
@@ -6164,8 +6204,8 @@ mod overview {
             "PID",
             "DESTINATION",
             "PORT",
-            "↓ RATE",
-            "↑ RATE",
+            "↓ IN",
+            "↑ OUT",
             "↓ TOTAL",
             "↑ TOTAL",
         ];
@@ -6195,8 +6235,8 @@ mod overview {
             "PID",
             "DESTINATION",
             "PORT",
-            "↓ RATE",
-            "↑ RATE",
+            "↓ IN",
+            "↑ OUT",
             "↓ TOTAL",
             "↑ TOTAL",
             "NAME",
@@ -6397,8 +6437,8 @@ mod overview {
             "PID",
             "DESTINATION",
             "PORT",
-            "↓ RATE",
-            "↑ RATE",
+            "↓ IN",
+            "↑ OUT",
             "TOTAL",
         ];
         // Wide enough for every column: all are there.
@@ -6489,8 +6529,8 @@ mod overview {
             "PID",
             "DESTINATION",
             "PORT",
-            "↓ RATE",
-            "↑ RATE",
+            "↓ IN",
+            "↑ OUT",
             "TOTAL",
         ];
         assert!(
@@ -7821,7 +7861,7 @@ mod steady_columns {
             &quiet,
             &busy,
             "DESTINATION",
-            &["PORT", "↓ RATE", "↑ RATE", "TOTAL"],
+            &["PORT", "↓ IN", "↑ OUT", "TOTAL"],
         );
     }
 
@@ -7833,7 +7873,7 @@ mod steady_columns {
             &quiet,
             &busy,
             "DESTINATION",
-            &["PORT", "↓ RATE", "↑ RATE", "↓ TOTAL", "↑ TOTAL"],
+            &["PORT", "↓ IN", "↑ OUT", "↓ TOTAL", "↑ TOTAL"],
         );
     }
 
@@ -7845,7 +7885,7 @@ mod steady_columns {
             &quiet,
             &busy,
             "↓ TOTAL",
-            &["↓ RATE", "↑ RATE", "↓ TOTAL", "↑ TOTAL"],
+            &["↓ IN", "↑ OUT", "↓ TOTAL", "↑ TOTAL"],
         );
     }
 
@@ -8026,13 +8066,17 @@ mod map_drawing {
 
     /// The map in the area below a one-line header on a 110×24 screen.
     fn draw_at(map: Option<&Map>, offset: usize) -> (Buffer, MapScroll) {
-        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        draw_wide(map, offset, 110)
+    }
+
+    fn draw_wide(map: Option<&Map>, offset: usize, width: u16) -> (Buffer, MapScroll) {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         let mut scroll = MapScroll::default();
         terminal
             .draw(|frame| {
                 scroll = draw_map(
                     frame,
-                    Rect::new(0, 1, 110, 22),
+                    Rect::new(0, 1, width, 22),
                     &Theme::default(),
                     map,
                     offset,
@@ -8126,7 +8170,7 @@ mod map_drawing {
             );
             // An unbroken line from the left spine to the last box's centre.
             let line = &cells[join];
-            let spine = 2;
+            let spine = box_left - 2;
             assert!(
                 (spine..centre + 22 * 3).all(|c| line[c] != " "),
                 "{name}: {}",
@@ -8138,6 +8182,94 @@ mod map_drawing {
         let (first_y, _) = find(&buffer, "this host");
         assert_eq!(label_y + 1, first_y - 2);
         assert!(text(&buffer)[usize::from(first_y) - 2].contains('┴'));
+    }
+
+    /// The empty cells left and right of everything drawn from the first row's
+    /// line down, inside the pane's border.
+    fn empty_sides(buffer: &Buffer) -> (u16, u16) {
+        let width = buffer.area.width;
+        let (host_y, _) = find(buffer, "this host");
+        let cells = lines(buffer);
+        let mut left = width;
+        let mut right = width;
+        for row in &cells[usize::from(host_y) - 2..22] {
+            let inside = &row[1..usize::from(width) - 1];
+            if let Some(first) = inside.iter().position(|c| c != " ") {
+                let last = inside.iter().rposition(|c| c != " ").unwrap();
+                left = left.min(first as u16);
+                right = right.min((inside.len() - 1 - last) as u16);
+            }
+        }
+        (left, right)
+    }
+
+    fn assert_centred(buffer: &Buffer, what: &str) {
+        let (left, right) = empty_sides(buffer);
+        assert!(
+            left <= right && right - left <= 1,
+            "{what}: {left} left, {right} right\n{}",
+            text(buffer).join("\n")
+        );
+    }
+
+    #[test]
+    fn several_rows_sit_in_the_middle_of_the_pane_at_every_width() {
+        for width in [110, 111, 125, 130, 131, 150] {
+            let (buffer, _) = draw_wide(Some(&map_of(11)), 0, width);
+            assert_centred(&buffer, &format!("{width} wide"));
+        }
+    }
+
+    #[test]
+    fn a_short_last_row_stays_at_the_left_of_the_block() {
+        let (buffer, _) = draw_wide(Some(&map_of(5)), 0, 130);
+        assert_eq!(find(&buffer, "host4").1, find(&buffer, "this host").1);
+        assert_centred(&buffer, "130 wide");
+    }
+
+    #[test]
+    fn one_row_of_two_boxes_sits_in_the_middle_under_the_gateway() {
+        for width in [110, 111, 130, 131] {
+            let (buffer, _) = draw_wide(Some(&map_of(1)), 0, width);
+            assert_centred(&buffer, &format!("{width} wide"));
+        }
+    }
+
+    #[test]
+    fn the_first_rows_line_stays_joined_when_the_rows_are_centred() {
+        for (others, width) in [(1, 130), (1, 131), (0, 130), (2, 111), (11, 130), (11, 131)] {
+            let (buffer, _) = draw_wide(Some(&map_of(others)), 0, width);
+            let (y, x) = find(&buffer, "this host");
+            let join = &lines(&buffer)[usize::from(y) - 2];
+            let reach = join
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| *c != " " && *i > 0 && *i < usize::from(width) - 1)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            let (first, last) = (reach[0], reach[reach.len() - 1]);
+            assert!(
+                (first..=last).all(|c| join[c] != " "),
+                "{others}/{width}: {}",
+                join.concat()
+            );
+            let centre = 1 + 2 + (usize::from(width) - 6) / 2;
+            assert!(
+                first <= centre.min(usize::from(x) + 8) && last >= centre,
+                "{}",
+                join.concat()
+            );
+        }
+    }
+
+    #[test]
+    fn a_map_with_no_devices_draws_the_part_above_the_rows_without_a_panic() {
+        let mut map = map_of(0);
+        map.devices.clear();
+        let (buffer, _) = draw_at(Some(&map), 0);
+        let rows = text(&buffer);
+        assert!(rows.iter().any(|r| r.contains("gateway")));
+        assert!(rows.iter().any(|r| r.contains("internet")));
     }
 
     #[test]

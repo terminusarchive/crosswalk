@@ -107,8 +107,8 @@ pub fn app_traffic_columns() -> Vec<Column> {
         Column::new("PID", Align::Left, 5, 1),
         Column::new("DESTINATION", Align::Left, 13, 6).fill(1),
         Column::new("PORT", Align::Left, 9, 5).at_least(9),
-        Column::new("↓ RATE", Align::Right, 10, 4).at_least(10),
-        Column::new("↑ RATE", Align::Right, 10, 3).at_least(10),
+        Column::new("↓ IN", Align::Right, 10, 4).at_least(10),
+        Column::new("↑ OUT", Align::Right, 10, 3).at_least(10),
         Column::new("TOTAL", Align::Right, 8, 2).at_least(8),
     ]
 }
@@ -280,8 +280,8 @@ pub fn app_traffic_zoom_columns() -> Vec<Column> {
         Column::new("PID", Align::Left, 5, 4),
         Column::new("DESTINATION", Align::Left, 15, 9),
         Column::new("PORT", Align::Left, 8, 8).at_least(9),
-        Column::new("↓ RATE", Align::Right, 10, 7).at_least(10),
-        Column::new("↑ RATE", Align::Right, 10, 6).at_least(10),
+        Column::new("↓ IN", Align::Right, 10, 7).at_least(10),
+        Column::new("↑ OUT", Align::Right, 10, 6).at_least(10),
         Column::new("↓ TOTAL", Align::Right, 9, 5).at_least(8),
         Column::new("↑ TOTAL", Align::Right, 9, 3).at_least(8),
         Column::new("NAME", Align::Left, 10, 2).fill(1),
@@ -413,7 +413,7 @@ pub fn uncounted_line(state: &AppState) -> Option<String> {
 
 pub fn blocked_columns() -> Vec<Column> {
     vec![
-        Column::new("LAST", Align::Left, 5, 1),
+        Column::new("LAST SEEN", Align::Left, 9, 1),
         Column::new("FROM", Align::Left, 15, 4).fill(1),
         Column::new("PORT", Align::Left, 9, 3),
         Column::new("HITS", Align::Right, 4, 2),
@@ -493,13 +493,13 @@ pub fn blocked_rows(
 
 pub fn blocked_zoom_columns() -> Vec<Column> {
     vec![
-        Column::new("LAST", Align::Left, 5, 9),
-        Column::new("FIRST", Align::Left, 5, 4),
+        Column::new("LAST SEEN", Align::Left, 9, 9),
+        Column::new("FIRST SEEN", Align::Left, 10, 4),
         Column::new("FROM", Align::Left, 15, 8),
         Column::new("PORT", Align::Left, 9, 6),
         Column::new("HITS", Align::Right, 4, 5),
-        Column::new("IFACE", Align::Left, 8, 3).at_most(IFACE_MAX),
-        Column::new("DIR", Align::Left, 4, 2),
+        Column::new("INTERFACE", Align::Left, 9, 3).at_most(IFACE_MAX),
+        Column::new("DIRECTION", Align::Left, 9, 2),
         Column::new("KIND", Align::Left, 7, 7),
         Column::new("NAME", Align::Left, 10, 1).fill(1),
     ]
@@ -711,8 +711,8 @@ pub fn interface_columns() -> Vec<Column> {
     vec![
         Column::new("", Align::Left, 1, 9),
         Column::new("INTERFACE", Align::Left, 9, 8).fill(1),
-        Column::new("↓ RATE", Align::Right, 10, 7).at_least(10),
-        Column::new("↑ RATE", Align::Right, 10, 6).at_least(10),
+        Column::new("↓ IN", Align::Right, 10, 7).at_least(10),
+        Column::new("↑ OUT", Align::Right, 10, 6).at_least(10),
         Column::new("↓ TOTAL", Align::Right, 9, 5).at_least(8),
         Column::new("↑ TOTAL", Align::Right, 9, 4).at_least(8),
     ]
@@ -929,6 +929,10 @@ pub fn rule_zoom_columns() -> Vec<Column> {
     let mut columns = rule_columns();
     // IFACE and APP are fixed columns here, as wide as their widest values up
     // to their ceilings; RULE takes the rest.
+    columns[0].title = "INTERFACE".into();
+    columns[0].min_width = 9;
+    columns[2].title = "DIRECTION".into();
+    columns[2].min_width = 9;
     columns[0].fill = None;
     columns[1].fill = None;
     columns[1].max_width = Some(APP_MAX);
@@ -1369,7 +1373,7 @@ pub fn wifi_columns() -> Vec<Column> {
     ]
 }
 
-/// Zoom adds BSSID (the hardware address) and FREQ; FREQ goes first when the
+/// Zoom adds BSSID (the hardware address) and FREQUENCY; FREQUENCY goes first when the
 /// pane is narrow, then BSSID.
 pub fn wifi_zoom_columns() -> Vec<Column> {
     vec![
@@ -1377,7 +1381,7 @@ pub fn wifi_zoom_columns() -> Vec<Column> {
         Column::new("SIGNAL", Align::Left, 8, 5),
         Column::new("SECURITY", Align::Left, 9, 4).at_most(WIFI_SECURITY_MAX),
         Column::new("BSSID", Align::Left, 17, 2),
-        Column::new("FREQ", Align::Right, 8, 1),
+        Column::new("FREQUENCY", Align::Right, 9, 1),
         Column::new("CHANNEL", Align::Left, 12, 3),
     ]
 }

@@ -1,8 +1,10 @@
 [package]
 name = "crosswalk"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
-description = "A read-only Linux terminal dashboard for your network"
+description = "A TUI network overview for Linux with 25 bundled themes"
+keywords = ["network", "tui", "monitoring", "firewall", "bandwidth"]
+categories = ["command-line-utilities", "network-programming"]
 license = "MIT"
 repository = "https://github.com/terminusarchive/crosswalk"
 

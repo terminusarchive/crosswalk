@@ -314,17 +314,20 @@ pub fn draw_map(
     let fit_rows = usize::from(inner.bottom().saturating_sub(y) / ROW_HEIGHT).max(1);
     let max_offset = rows.saturating_sub(fit_rows);
     let offset = offset.min(max_offset);
-    let left_edge = inner.x + gutter;
+    // The block of rows is as wide as a full row, or as the boxes of a single row, and sits in the middle.
+    let block = (count.min(columns) as u16 * (BOX_WIDTH + 1)).saturating_sub(1) + gutter;
+    let origin = inner.x + inner.width.saturating_sub(block) / 2;
+    let left_edge = origin + gutter;
     for (n, row) in (offset..rows.min(offset + fit_rows)).enumerate() {
         let top = y + n as u16 * ROW_HEIGHT;
         let boxes = &map.devices[row * columns..count.min((row + 1) * columns)];
         let stem = |c: usize| left_edge + c as u16 * (BOX_WIDTH + 1) + BOX_WIDTH / 2;
         let ends = (stem(0), stem(boxes.len() - 1));
         let last_row = row + 1 == rows;
-        let from = if spine { inner.x } else { ends.0.min(centre) };
+        let from = if spine { origin } else { ends.0.min(centre) };
         let to = if row == 0 { ends.1.max(centre) } else { ends.1 };
         for x in from..=to {
-            let at_spine = spine && x == inner.x;
+            let at_spine = spine && x == origin;
             let up = (row == 0 && x == centre) || (at_spine && row > 0);
             let down = (x >= left_edge && (0..boxes.len()).any(|c| stem(c) == x))
                 || (at_spine && !last_row);
@@ -332,7 +335,7 @@ pub fn draw_map(
         }
         if spine && !last_row {
             for dy in 1..=BOX_HEIGHT {
-                canvas.text(inner.x, top + dy, "│", line);
+                canvas.text(origin, top + dy, "│", line);
             }
         }
         for (c, device) in boxes.iter().enumerate() {
