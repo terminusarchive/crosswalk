@@ -1,0 +1,30 @@
+# Crosswalk's defaults are UFW, the kernel journal, and reverse DNS enabled.
+# Set reverse_dns = false to start with names off; press n in the UI to toggle.
+firewall_provider = "ufw"
+ufw_source = "journal"
+reverse_dns = true
+
+# To follow a UFW log file instead, replace the source above with:
+# ufw_source = "file:/var/log/ufw.log"
+
+# Colours. Remove the leading "# " from the table header and from any line you
+# want to change. Values are #rrggbb. Names you leave out keep the default
+# shown here.
+# A built-in theme to start with: synthwave (the default), dracula, nord,
+# gruvbox, catppuccin, tokyo-night, solarized, monokai, one-dark, everforest,
+# rose-pine, kanagawa, ayu, night-owl, github-dark, palenight (dark);
+# solarized-light, gruvbox-light, catppuccin-latte, github-light (bright);
+# mono, amber, green, paper (monochrome); or terminal.
+# The header shows the one in use. --theme NAME on the command line wins over this. The colours below are laid over whichever theme is shown.
+# [theme]
+# name = "synthwave"
+# background = "#1a0b2e"  # screen background
+# text = "#f0e6ff"        # ordinary text
+# muted = "#8a7aaa"       # unfocused borders, column titles, idle rows, secondary text
+# inbound = "#00f0ff"     # inbound traffic: lower chart half, download rates
+# outbound = "#ff2a8a"    # outbound traffic: upper chart half, upload rates
+# accent = "#b05cff"      # focused pane border and title
+# warning = "#ff9a3c"     # unknown apps, limited ports, degraded sources
+# danger = "#ff3860"      # open ports, failed sources
+# ok = "#3cff9a"          # healthy sources
+# highlight = "#ffe66d"   # the interface name in the Bandwidth title
