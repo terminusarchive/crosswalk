@@ -5,11 +5,8 @@ use crosswalk::{
     privileges::{Capabilities, missing_net_raw_message},
 };
 
-fn both(net_raw: bool, sys_ptrace: bool) -> Option<Capabilities> {
-    Some(Capabilities {
-        net_raw,
-        sys_ptrace,
-    })
+fn net_raw(held: bool) -> Option<Capabilities> {
+    Some(Capabilities { net_raw: held })
 }
 
 fn scratch_dir_with_dumpcap(name: &str, mode: Option<u32>) -> std::path::PathBuf {
@@ -37,8 +34,8 @@ fn choice(capabilities: Option<Capabilities>, directory: &std::path::Path) -> Ca
 fn a_binary_holding_net_raw_captures_by_itself_whatever_dumpcap_is() {
     let runnable = scratch_dir_with_dumpcap("granted-x", Some(0o755));
     let missing = scratch_dir_with_dumpcap("granted-none", None);
-    assert_eq!(choice(both(true, true), &runnable), CaptureChoice::Own);
-    assert_eq!(choice(both(true, false), &missing), CaptureChoice::Own);
+    assert_eq!(choice(net_raw(true), &runnable), CaptureChoice::Own);
+    assert_eq!(choice(net_raw(true), &missing), CaptureChoice::Own);
 }
 
 #[test]
@@ -50,16 +47,13 @@ fn unknown_capabilities_capture_by_itself() {
 #[test]
 fn without_net_raw_an_executable_dumpcap_is_chosen() {
     let runnable = scratch_dir_with_dumpcap("runnable", Some(0o755));
-    assert_eq!(
-        choice(both(false, false), &runnable),
-        CaptureChoice::Dumpcap
-    );
+    assert_eq!(choice(net_raw(false), &runnable), CaptureChoice::Dumpcap);
 }
 
 #[test]
 fn a_dumpcap_the_user_cannot_run_gives_both_ways_out_naming_the_group_and_the_user() {
     let locked = scratch_dir_with_dumpcap("locked", Some(0o640));
-    let CaptureChoice::Stop(message) = choice(both(false, false), &locked) else {
+    let CaptureChoice::Stop(message) = choice(net_raw(false), &locked) else {
         panic!("expected a stop");
     };
     assert!(message.contains(&missing_net_raw_message("/opt/crosswalk")));
@@ -74,7 +68,7 @@ fn a_dumpcap_the_user_cannot_run_gives_both_ways_out_naming_the_group_and_the_us
 #[test]
 fn no_dumpcap_gives_today_s_text_and_the_line_about_installing_it() {
     let empty = scratch_dir_with_dumpcap("empty", None);
-    let CaptureChoice::Stop(message) = choice(both(false, false), &empty) else {
+    let CaptureChoice::Stop(message) = choice(net_raw(false), &empty) else {
         panic!("expected a stop");
     };
     assert!(message.contains(&missing_net_raw_message("/opt/crosswalk")));

@@ -9,12 +9,14 @@ use crate::{
     collect::{
         attribution::{AttributionStatus, ExecutableIdentity, Listener, ProcessIdentity},
         capture::{CaptureStatus, Direction, Endpoint, Protocol, TrafficEvent},
-        interfaces::{CollectionHealth, InterfaceSnapshot},
+        interfaces::{CollectionHealth, InterfaceSnapshot, InterfaceStatus},
         neighbors::{Neighbor, NeighborSnapshot},
         wifi::{AccessPoint, ScanOutcome, WifiSnapshot},
     },
     events::{EventKind, EventLevel, EventLog, NetworkEvent},
-    firewall::{Exposure, FirewallEvent, FirewallStatus, RuleSnapshot, exposure},
+    firewall::{
+        Exposure, FirewallEvent, FirewallStatus, InterfaceAddresses, RuleSnapshot, exposure,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -149,7 +151,6 @@ pub struct BlockedRow {
     pub interface: Option<String>,
     pub count: u64,
     pub first_seen: Duration,
-    pub last_seen: Duration,
     /// Local wall-clock `HH:MM` of the latest event that carried a timestamp.
     pub last_clock: Option<String>,
     /// Local wall-clock `HH:MM` of the first event that carried a timestamp.
@@ -189,6 +190,8 @@ pub const HISTORY_SECONDS: usize = 8;
 
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 const REMOVE_AFTER: Duration = Duration::from_secs(300);
+/// How long a capture drop counts as recent.
+const RECENT_DROPS: Duration = Duration::from_secs(10);
 
 struct Destination {
     remote: Endpoint,
@@ -252,6 +255,8 @@ pub struct AppState {
     interfaces: Option<InterfaceSnapshot>,
     source_health: SourceHealth,
     now: Duration,
+    /// When capture drops were reported and how many, newest last.
+    capture_drops: Vec<(Duration, u64)>,
     rate_history: HashMap<String, VecDeque<RateSample>>,
     listeners: Vec<Listener>,
     ephemeral_ports: RangeInclusive<u16>,
@@ -307,6 +312,7 @@ impl AppState {
             interfaces: None,
             source_health: SourceHealth::default(),
             now: Duration::ZERO,
+            capture_drops: Vec::new(),
             rate_history: HashMap::new(),
             listeners: Vec::new(),
             ephemeral_ports: DEFAULT_EPHEMERAL_PORTS,
@@ -882,12 +888,13 @@ impl AppState {
             .rules
             .clone()
             .unwrap_or_else(|| RuleSnapshot::Unavailable("rules not read yet".to_owned()));
+        let addresses = self.interface_addresses();
         let mut ports: Vec<ListeningPort> = self
             .listeners
             .iter()
             .filter(|l| l.protocol != Protocol::Udp || l.port < *self.ephemeral_ports.start())
             .map(|l| ListeningPort {
-                exposure: exposure(l, &rules),
+                exposure: exposure(l, &rules, addresses.as_deref()),
                 listener: l.clone(),
             })
             .collect();
@@ -985,6 +992,24 @@ impl AppState {
             .collect()
     }
 
+    fn interface_addresses(&self) -> Option<Vec<InterfaceAddresses>> {
+        let snapshot = self
+            .interfaces
+            .as_ref()
+            .filter(|snapshot| snapshot.health == CollectionHealth::Available)?;
+        Some(
+            snapshot
+                .interfaces
+                .iter()
+                .map(|interface| InterfaceAddresses {
+                    name: interface.name.clone(),
+                    up: interface.status == InterfaceStatus::Available && interface.is_up,
+                    addresses: interface.addresses.iter().map(|a| a.ip).collect(),
+                })
+                .collect(),
+        )
+    }
+
     /// The latest interface snapshot: addresses, default route, gateway and name server.
     pub fn interface_snapshot(&self) -> Option<&InterfaceSnapshot> {
         self.interfaces.as_ref()
@@ -1037,7 +1062,6 @@ impl AppState {
             .find(|r| (r.kind, r.source, r.port, r.protocol, r.direction) == key)
         {
             row.count += 1;
-            row.last_seen = row.last_seen.max(at);
             row.interface = interface.or(row.interface.take());
             row.first_clock = row.first_clock.take().or_else(|| clock.clone());
             row.last_clock = clock.or(row.last_clock.take());
@@ -1054,7 +1078,6 @@ impl AppState {
                 interface,
                 count: 1,
                 first_seen: at,
-                last_seen: at,
                 first_clock: clock.clone(),
                 last_clock: clock,
             },
@@ -1140,7 +1163,22 @@ impl AppState {
     }
 
     pub fn record_capture_status(&mut self, status: CaptureStatus) {
+        if status.dropped > 0 {
+            let now = self.now;
+            self.capture_drops
+                .retain(|(at, _)| now.saturating_sub(*at) < RECENT_DROPS);
+            self.capture_drops.push((now, status.dropped));
+        }
         self.source_health.capture = Some(status);
+    }
+
+    /// Packets dropped within `RECENT_DROPS` of now.
+    pub fn recent_drops(&self) -> u64 {
+        self.capture_drops
+            .iter()
+            .filter(|(at, _)| self.now.saturating_sub(*at) < RECENT_DROPS)
+            .map(|(_, dropped)| dropped)
+            .sum()
     }
 
     pub fn record_firewall_status(&mut self, status: FirewallStatus) {

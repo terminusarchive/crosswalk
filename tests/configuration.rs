@@ -44,7 +44,75 @@ fn rejects_unknown_firewall_provider() {
     let output = crosswalk(&["--firewall-provider", "nftables"]);
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("unsupported firewall provider 'nftables'; expected 'ufw'"));
+    assert!(stderr(&output).contains(
+        "unsupported firewall provider 'nftables'; expected 'auto', 'ufw', 'firewalld' or 'none'"
+    ));
+}
+
+#[test]
+fn the_provider_is_auto_when_neither_command_line_nor_file_names_one() {
+    let config = Config::load_from(["crosswalk"]).expect("defaults should load");
+
+    assert_eq!(config.firewall_provider, FirewallProvider::Auto);
+}
+
+#[test]
+fn auto_ufw_firewalld_and_none_are_accepted_from_the_command_line_and_from_the_file() {
+    for (value, expected) in [
+        ("auto", FirewallProvider::Auto),
+        ("ufw", FirewallProvider::Ufw),
+        ("firewalld", FirewallProvider::Firewalld),
+        ("none", FirewallProvider::None),
+    ] {
+        let from_cli = Config::load_from(["crosswalk", "--firewall-provider", value])
+            .expect("the command line value should be accepted");
+        let from_file = theme_config(&format!("firewall_provider = \"{value}\"\n"))
+            .expect("the file value should be accepted");
+
+        assert_eq!(from_cli.firewall_provider, expected);
+        assert_eq!(from_file.firewall_provider, expected);
+    }
+}
+
+#[test]
+fn a_provider_in_the_file_is_overridden_by_the_command_line() {
+    let path = temporary_config("firewall_provider = \"none\"\n");
+    let config = Config::load_from([
+        "crosswalk",
+        "--config",
+        path.to_str().expect("temporary path should be UTF-8"),
+        "--firewall-provider",
+        "auto",
+    ])
+    .expect("the configuration should load");
+    fs::remove_file(path).expect("temporary configuration should be removed");
+
+    assert_eq!(config.firewall_provider, FirewallProvider::Auto);
+}
+
+#[test]
+fn the_ufw_source_is_checked_and_kept_with_provider_none() {
+    let wrong = Config::load_from([
+        "crosswalk",
+        "--firewall-provider",
+        "none",
+        "--ufw-source",
+        "syslog",
+    ]);
+    let right = Config::load_from([
+        "crosswalk",
+        "--firewall-provider",
+        "none",
+        "--ufw-source",
+        "file:/var/log/ufw.log",
+    ])
+    .expect("a right source should be accepted with provider none");
+
+    assert!(wrong.is_err());
+    assert_eq!(
+        right.ufw_source,
+        UfwSource::File(PathBuf::from("/var/log/ufw.log"))
+    );
 }
 
 #[test]

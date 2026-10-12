@@ -334,7 +334,6 @@ fn decoded_ip(
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureStatistics {
-    pub received: u32,
     pub dropped: u32,
     pub interface_dropped: u32,
 }
@@ -393,10 +392,7 @@ pub enum CaptureHealth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureStatus {
     pub health: CaptureHealth,
-    pub packets_read: u64,
-    pub capture_received: u32,
-    pub capture_dropped: u32,
-    pub delivery_dropped: u64,
+    pub dropped: u64,
     pub origin: CaptureOrigin,
 }
 
@@ -404,7 +400,10 @@ pub struct CaptureWorker<S> {
     source: S,
     normalizer: CaptureNormalizer,
     batch_limit: usize,
+    /// Events dropped on a full queue since the last status.
     delivery_dropped: u64,
+    /// The kernel's cumulative count at the last reading.
+    kernel_dropped: u32,
 }
 
 impl<S: CaptureSource> CaptureWorker<S> {
@@ -427,6 +426,7 @@ impl<S: CaptureSource> CaptureWorker<S> {
             normalizer: CaptureNormalizer::new(local_addresses),
             batch_limit,
             delivery_dropped: 0,
+            kernel_dropped: 0,
         })
     }
 
@@ -442,16 +442,12 @@ impl<S: CaptureSource> CaptureWorker<S> {
         if cancelled.load(Ordering::Relaxed) {
             return CaptureStatus {
                 health: CaptureHealth::Cancelled,
-                packets_read: 0,
-                capture_received: 0,
-                capture_dropped: 0,
-                delivery_dropped: self.delivery_dropped,
+                dropped: std::mem::take(&mut self.delivery_dropped),
                 origin: self.source.origin(),
             };
         }
 
         let mut health = CaptureHealth::Available;
-        let mut packets_read = 0;
         for _ in 0..self.batch_limit {
             if cancelled.load(Ordering::Relaxed) {
                 health = CaptureHealth::Cancelled;
@@ -462,7 +458,6 @@ impl<S: CaptureSource> CaptureWorker<S> {
                     // The read: the moment `next_packet` returned.
                     let read_at = Instant::now();
                     let read_wall = SystemTime::now();
-                    packets_read += 1;
                     if let Some(mut event) = self.normalizer.normalize(&data) {
                         event.timing = Some(ReadTiming {
                             lag: captured_at.and_then(|at| read_wall.duration_since(at).ok()),
@@ -490,25 +485,36 @@ impl<S: CaptureSource> CaptureWorker<S> {
             }
         }
 
-        let statistics = match self.source.statistics() {
-            Ok(statistics) => statistics,
+        let kernel_dropped = match self.source.statistics() {
+            Ok(statistics) => self.drops_since_last_reading(&statistics),
             Err(error) => {
                 if health == CaptureHealth::Available {
                     health = CaptureHealth::Degraded(error);
                 }
-                CaptureStatistics::default()
+                0
             }
         };
         CaptureStatus {
             health,
-            packets_read,
-            capture_received: statistics.received,
-            capture_dropped: statistics
-                .dropped
-                .saturating_add(statistics.interface_dropped),
-            delivery_dropped: self.delivery_dropped,
+            dropped: kernel_dropped.saturating_add(std::mem::take(&mut self.delivery_dropped)),
             origin: self.source.origin(),
         }
+    }
+}
+
+impl<S: CaptureSource> CaptureWorker<S> {
+    /// The kernel's count only grows while a capture stays open; a lower count is a
+    /// capture opened again, whose drops are all new.
+    fn drops_since_last_reading(&mut self, statistics: &CaptureStatistics) -> u64 {
+        let count = statistics
+            .dropped
+            .saturating_add(statistics.interface_dropped);
+        let previous = std::mem::replace(&mut self.kernel_dropped, count);
+        u64::from(if count >= previous {
+            count - previous
+        } else {
+            count
+        })
     }
 }
 
@@ -570,7 +576,6 @@ impl CaptureSource for PcapSource {
         self.capture
             .stats()
             .map(|statistics| CaptureStatistics {
-                received: statistics.received,
                 dropped: statistics.dropped,
                 interface_dropped: statistics.if_dropped,
             })

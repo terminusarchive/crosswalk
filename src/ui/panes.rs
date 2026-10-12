@@ -7,9 +7,10 @@ use ratatui::style::{Color, Style};
 
 use super::{
     Theme, bound_text,
-    format::{format_bytes, format_rate},
+    format::{format_bytes, format_count, format_rate},
     table::{Align, Cell, Column, Row, cut_left, filter_rows},
     whole_text,
+    zone_rows::{shows_zones, zone_columns, zone_rows},
 };
 use crate::{
     collect::{
@@ -22,7 +23,8 @@ use crate::{
     dns::ReverseDns,
     events::{EventKind, EventLevel},
     firewall::{
-        Exposure, FirewallHealth, Network, Rule, RuleAction, RuleDirection, RuleSnapshot,
+        Exposure, FIREWALLD_OFF, FirewallHealth, NO_DEFAULT_ZONE, NO_INTERFACE_READING,
+        NO_USABLE_INTERFACE, NOT_READABLE, Network, Rule, RuleAction, RuleDirection, RuleSnapshot,
         RuleSource,
     },
     state::{
@@ -603,11 +605,11 @@ pub fn event_rows(state: &AppState, theme: &Theme, search: &str) -> Vec<Row> {
 
 pub fn listening_columns() -> Vec<Column> {
     vec![
-        Column::new("PORT", Align::Left, 8, 4),
         Column::new("APP", Align::Left, 8, 2).fill(1),
         Column::new("PID", Align::Left, 5, 0),
-        Column::new("BIND", Align::Left, 9, 1),
-        Column::new("FIREWALL", Align::Left, 12, 3),
+        Column::new("BIND", Align::Right, 9, 1),
+        Column::new("PORT", Align::Right, 8, 4),
+        Column::new("FIREWALL", Align::Right, 12, 3),
     ]
 }
 
@@ -645,18 +647,25 @@ pub fn listening_rows(state: &AppState, theme: &Theme, search: &str) -> Vec<Row>
 
 pub fn listening_zoom_columns() -> Vec<Column> {
     vec![
-        Column::new("PORT", Align::Left, 8, 7),
         Column::new("APP", Align::Left, 8, 6).at_most(APP_MAX),
         Column::new("PID", Align::Left, 5, 3),
-        Column::new("BIND", Align::Left, 9, 5),
-        Column::new("FIREWALL", Align::Left, 12, 8),
+        Column::new("BIND", Align::Right, 9, 5),
+        Column::new("PORT", Align::Right, 8, 7),
+        Column::new("FIREWALL", Align::Right, 12, 8),
         Column::new("RULE", Align::Left, 14, 2).at_most(RULE_MAX),
         Column::new("PATH", Align::Left, 10, 1).fill(1),
     ]
 }
 
-fn rule_text(exposure: &Exposure) -> String {
+/// The zoom's RULE cell. A zone's exposure carries no rule text, so it reads `—` and not
+/// `default policy`.
+fn rule_text(exposure: &Exposure, snapshot: Option<&RuleSnapshot>) -> String {
     match exposure {
+        Exposure::Open(_) | Exposure::Limited(_) | Exposure::Blocked(_)
+            if matches!(snapshot, Some(RuleSnapshot::Zones(_))) =>
+        {
+            "—".to_owned()
+        }
         Exposure::Open(rule) | Exposure::Limited(rule) | Exposure::Blocked(rule) => rule
             .as_deref()
             .map_or("default policy".to_owned(), bound_text),
@@ -679,15 +688,15 @@ fn listening_rows_for(state: &AppState, theme: &Theme, search: &str, zoom: bool)
                 };
                 let owner = p.listener.owners.first();
                 let mut cells = vec![
-                    port_text(Some(p.listener.port), p.listener.protocol),
                     first_app(&p),
                     owner.map_or("—".to_owned(), |o| o.pid.to_string()),
                     p.listener.address.to_string(),
+                    port_text(Some(p.listener.port), p.listener.protocol),
                     text.to_owned(),
                 ];
                 if zoom {
                     cells.push(if read {
-                        rule_text(&p.exposure)
+                        rule_text(&p.exposure, state.rule_snapshot())
                     } else {
                         "—".to_owned()
                     });
@@ -778,7 +787,14 @@ pub fn zoom_table(
             interface_columns(),
             interface_rows(state, theme, search, plotted),
         ),
-        Pane::FirewallRules => (rule_zoom_columns(), rule_zoom_rows(state, theme, search)),
+        Pane::FirewallRules => (
+            if state.rule_snapshot().is_some_and(shows_zones) {
+                zone_columns()
+            } else {
+                rule_zoom_columns()
+            },
+            rule_zoom_rows(state, theme, search),
+        ),
         Pane::NetworkEvents => (events_columns(), event_rows(state, theme, search)),
         Pane::Neighbors => (
             neighbor_zoom_columns(names.is_some()),
@@ -924,6 +940,15 @@ pub fn rule_columns() -> Vec<Column> {
             .lead(2)
             .at_most(REMOTE_MAX),
     ]
+}
+
+/// The columns of Firewall Rules: UFW's rules, or the lines of firewalld's zones.
+pub fn rules_columns(state: &AppState) -> Vec<Column> {
+    if state.rule_snapshot().is_some_and(shows_zones) {
+        zone_columns()
+    } else {
+        rule_columns()
+    }
 }
 
 pub fn rule_zoom_columns() -> Vec<Column> {
@@ -1105,6 +1130,12 @@ fn rule_row(
 
 /// One row per rule, v4 and v6 twins merged and a one-family rule marked.
 pub fn rule_rows(state: &AppState, theme: &Theme, search: &str) -> Vec<Row> {
+    if let Some(snapshot) = state
+        .rule_snapshot()
+        .filter(|snapshot| shows_zones(snapshot))
+    {
+        return filter_rows(zone_rows(snapshot, theme), search);
+    }
     let listeners = rule_listeners(state);
     filter_rows(
         merged_rules(state)
@@ -1117,6 +1148,9 @@ pub fn rule_rows(state: &AppState, theme: &Theme, search: &str) -> Vec<Row> {
 
 /// The overview's cells and the rule's text as UFW records it.
 pub fn rule_zoom_rows(state: &AppState, theme: &Theme, search: &str) -> Vec<Row> {
+    if state.rule_snapshot().is_some_and(shows_zones) {
+        return rule_rows(state, theme, search);
+    }
     let listeners = rule_listeners(state);
     filter_rows(
         merged_rules(state)
@@ -1140,6 +1174,11 @@ pub fn rules_empty(state: &AppState) -> &'static str {
     }
 }
 
+/// The reasons the zones cannot judge a port.
+fn exposure_is_unjudged(reason: &str) -> bool {
+    [NO_INTERFACE_READING, NO_USABLE_INTERFACE, NO_DEFAULT_ZONE].contains(&reason)
+}
+
 fn exposure_cell(exposure: &Exposure, theme: &Theme) -> (&'static str, Style) {
     match exposure {
         Exposure::Open(_) => ("● open", theme.open()),
@@ -1147,6 +1186,10 @@ fn exposure_cell(exposure: &Exposure, theme: &Theme) -> (&'static str, Style) {
         Exposure::Blocked(_) => ("· blocked", theme.observed()),
         Exposure::Local => ("· local", theme.muted()),
         Exposure::Unknown(reason) if reason == "ufw off" => ("? ufw off", theme.muted()),
+        Exposure::Unknown(reason) if reason == "no firewall" => ("? no firewall", theme.muted()),
+        Exposure::Unknown(reason) if reason == FIREWALLD_OFF => ("? fwd off", theme.muted()),
+        Exposure::Unknown(reason) if reason == NOT_READABLE => ("? not readable", theme.muted()),
+        Exposure::Unknown(reason) if exposure_is_unjudged(reason) => ("? unknown", theme.muted()),
         Exposure::Unknown(_) => ("? unreadable", theme.muted()),
     }
 }
@@ -1171,27 +1214,53 @@ impl Level {
     }
 }
 
-pub fn indicators(state: &AppState) -> [(&'static str, Level); 4] {
+/// The capture indicator's name; `compact` drops `dumpcap` while a drop count shows.
+fn capture_label(origin: Option<CaptureOrigin>, drops: u64, compact: bool) -> String {
+    let source = (origin == Some(CaptureOrigin::Dumpcap) && !(compact && drops > 0))
+        .then(|| "dumpcap".to_owned());
+    let dropped = (drops > 0).then(|| format!("{} dropped", format_count(drops)));
+    let details = [source, dropped]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if details.is_empty() {
+        "capture".to_owned()
+    } else {
+        format!("capture ({details})")
+    }
+}
+
+/// The header's four indicators; `compact` is the capture label without `dumpcap` when
+/// drops show.
+pub fn indicators(state: &AppState, compact: bool) -> [(String, Level); 4] {
     let health = state.source_health();
-    let capture_name = match health.capture.as_ref().map(|s| s.origin) {
-        Some(CaptureOrigin::Dumpcap) => "capture (dumpcap)",
-        Some(CaptureOrigin::Own) | None => "capture",
-    };
+    let drops = state.recent_drops();
+    let capture_name = capture_label(health.capture.as_ref().map(|s| s.origin), drops, compact);
     let capture = health
         .capture
         .as_ref()
         .map_or(Level::Unknown, |s| match s.health {
+            CaptureHealth::Available if drops > 0 => Level::Warn,
             CaptureHealth::Available => Level::Ok,
             CaptureHealth::Degraded(_) => Level::Warn,
             CaptureHealth::Cancelled => Level::Bad,
         });
+    let firewall_name = health
+        .firewall
+        .as_ref()
+        .map_or("firewall".to_owned(), |s| format!("firewall ({})", s.name));
     let firewall = health
         .firewall
         .as_ref()
         .map_or(Level::Unknown, |s| match s.health {
-            FirewallHealth::Available | FirewallHealth::AwaitingEvents => Level::Ok,
+            FirewallHealth::Available
+            | FirewallHealth::AwaitingEvents
+            | FirewallHealth::NotLogging
+            | FirewallHealth::DependsOnLogging => Level::Ok,
             FirewallHealth::Degraded(_) | FirewallHealth::Disabled(_) => Level::Warn,
             FirewallHealth::Unavailable(_) | FirewallHealth::Cancelled => Level::Bad,
+            FirewallHealth::NoFirewall => Level::Unknown,
         });
     let interfaces = health
         .interfaces
@@ -1205,17 +1274,34 @@ pub fn indicators(state: &AppState) -> [(&'static str, Level); 4] {
         .attribution
         .as_ref()
         .map_or(Level::Unknown, |s| match s.health {
-            AttributionHealth::Available if s.limited => Level::Warn,
             AttributionHealth::Available => Level::Ok,
             AttributionHealth::Stale(_) => Level::Warn,
             AttributionHealth::Unavailable(_) => Level::Bad,
         });
+    let apps_name = match health
+        .attribution
+        .as_ref()
+        .and_then(|s| s.only_user.as_ref())
+    {
+        Some(user) => format!("apps ({user})"),
+        None => "apps".to_owned(),
+    };
     [
         (capture_name, capture),
-        ("firewall", firewall),
-        ("interfaces", interfaces),
-        ("apps", apps),
+        (firewall_name, firewall),
+        ("interfaces".to_owned(), interfaces),
+        (apps_name, apps),
     ]
+}
+
+const FIREWALLD_STOPPED: &str = "firewalld is not running, so ";
+const ZONES_ONLY: &str = "firewalld shows this user only its zones";
+const SEE_DOCS: &str = "See docs/firewall.md";
+
+const TURN_ON_LOG_DENIED: &str = "sudo firewall-cmd --set-log-denied=all";
+
+fn no_firewall(consequence: &str) -> String {
+    format!("No supported firewall found, so {consequence}. See docs/firewall.md")
 }
 
 fn unreadable_rules(why: &str) -> String {
@@ -1269,16 +1355,13 @@ pub fn notice(state: &AppState, pane: Pane) -> Option<String> {
     };
     match pane {
         Pane::AppTraffic => capture()
-            .or_else(|| attribution("App names are unavailable", "App names are out of date"))
-            .or_else(|| {
-                health.attribution.as_ref().filter(|s| s.limited).map(|_| {
-                    "Other users' programs cannot be named: needs cap_sys_ptrace. \
-                     See README, Running without sudo."
-                        .to_owned()
-                })
-            }),
+            .or_else(|| attribution("App names are unavailable", "App names are out of date")),
         Pane::FirewallBlocks => health.firewall.as_ref().and_then(|s| match &s.health {
             FirewallHealth::Available | FirewallHealth::AwaitingEvents => None,
+            FirewallHealth::NoFirewall => Some(no_firewall("no blocks are reported")),
+            FirewallHealth::Disabled(_) if s.name == "fwd" => Some(format!(
+                "{FIREWALLD_STOPPED}no blocks are reported. {SEE_DOCS}"
+            )),
             FirewallHealth::Disabled(r) => Some(format!(
                 "UFW logging is off ({}). See docs/firewall.md",
                 reason(r)
@@ -1292,6 +1375,12 @@ pub fn notice(state: &AppState, pane: Pane) -> Option<String> {
                 reason(r)
             )),
             FirewallHealth::Cancelled => Some("Firewall log reading has stopped.".to_owned()),
+            FirewallHealth::NotLogging => Some(format!(
+                "firewalld is not logging denied packets. Turn it on with: {TURN_ON_LOG_DENIED}"
+            )),
+            FirewallHealth::DependsOnLogging => Some(format!(
+                "Blocks show only if firewalld logs denied packets: {TURN_ON_LOG_DENIED}"
+            )),
         }),
         Pane::ListeningPorts => attribution(
             "No ports listed: app attribution is unavailable",
@@ -1302,14 +1391,28 @@ pub fn notice(state: &AppState, pane: Pane) -> Option<String> {
             Some(RuleSnapshot::Inactive) => {
                 Some("UFW is off, so exposure is unknown. See docs/firewall.md".to_owned())
             }
-            Some(RuleSnapshot::Active { .. }) | None => None,
+            Some(RuleSnapshot::NoFirewall) => Some(no_firewall("exposure is unknown")),
+            Some(RuleSnapshot::FirewalldOff) => Some(format!(
+                "{FIREWALLD_STOPPED}exposure is unknown. {SEE_DOCS}"
+            )),
+            Some(RuleSnapshot::ZonesOnly(_)) => Some(format!(
+                "{ZONES_ONLY}, so exposure is unknown. Run with sudo to see it."
+            )),
+            Some(RuleSnapshot::Active { .. } | RuleSnapshot::Zones(_)) | None => None,
         }),
         Pane::FirewallRules => match state.rule_snapshot() {
             Some(RuleSnapshot::Unavailable(r)) => Some(unreadable_rules(r)),
             Some(RuleSnapshot::Inactive) => {
                 Some("UFW is off, so there are no rules to show. See docs/firewall.md".to_owned())
             }
-            Some(RuleSnapshot::Active { .. }) | None => None,
+            Some(RuleSnapshot::NoFirewall) => Some(no_firewall("there are no rules to show")),
+            Some(RuleSnapshot::FirewalldOff) => Some(format!(
+                "{FIREWALLD_STOPPED}there are no rules to show. {SEE_DOCS}"
+            )),
+            Some(RuleSnapshot::ZonesOnly(_)) => {
+                Some(format!("{ZONES_ONLY}. Run with sudo to see the rules."))
+            }
+            Some(RuleSnapshot::Active { .. } | RuleSnapshot::Zones(_)) | None => None,
         },
         Pane::Neighbors => match state.neighbors() {
             Some(Err(why)) => Some(format!("Cannot read the neighbor table ({}).", reason(why))),
@@ -1404,20 +1507,29 @@ pub fn wifi_zoom_columns() -> Vec<Column> {
 }
 
 /// Four bars, lit from the left; an unlit bar is a low dot. 80 and above is
-/// four, 55 to 79 three, 30 to 54 two, anything below one.
-fn signal_text(signal: u8) -> String {
-    let lit = match signal {
-        80.. => 4,
-        55..=79 => 3,
-        30..=54 => 2,
-        _ => 1,
+/// four, 55 to 79 three, 30 to 54 two, anything below one. The lit bars take
+/// the healthy, warning or danger colour by how many there are, the dots are
+/// muted and the number keeps the text colour.
+fn signal_cell(signal: u8, theme: &Theme) -> Cell {
+    let (lit, colour) = match signal {
+        80.. => (4, theme.ok),
+        55..=79 => (3, theme.ok),
+        30..=54 => (2, theme.warning),
+        _ => (1, theme.danger),
     };
-    let bars: String = "▂▄▆█"
+    let bars = "▂▄▆█".chars().enumerate().map(|(n, bar)| {
+        if n < lit {
+            (bar, Style::default().fg(colour))
+        } else {
+            ('·', theme.muted())
+        }
+    });
+    let number = format!(" {signal:>3}")
         .chars()
-        .enumerate()
-        .map(|(n, bar)| if n < lit { bar } else { '·' })
-        .collect();
-    format!("{bars} {signal:>3}")
+        .map(|digit| (digit, theme.text()))
+        .collect::<Vec<_>>();
+    let (glyphs, styles) = bars.chain(number).unzip::<_, _, String, Vec<Style>>();
+    Cell::new(glyphs).glyph_styles(styles)
 }
 
 /// The channel, right-justified in three cells, and its band, written `2.4G`,
@@ -1466,10 +1578,10 @@ fn wifi_row(entry: &WifiEntry, theme: &Theme, zoom: bool) -> Row {
         Cell::new(security)
     };
     let signal = match entry.seen_ago {
-        None => signal_text(point.signal),
-        Some(ago) => seen_text(ago),
+        None => signal_cell(point.signal, theme),
+        Some(ago) => Cell::new(seen_text(ago)),
     };
-    let mut cells = vec![network, Cell::new(signal), security];
+    let mut cells = vec![network, signal, security];
     if zoom {
         cells.push(Cell::new(bound_text(&point.bssid)));
         cells.push(Cell::new(format!("{} MHz", point.frequency_mhz)));

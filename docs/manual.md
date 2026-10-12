@@ -1,6 +1,6 @@
 # Crosswalk manual
 
-Crosswalk is a read-only Linux terminal dashboard for your network. Seven panes on two pages show how much traffic crosses an interface, which apps are sending data out and to where, which local ports are listening and whether UFW lets traffic reach them, which inbound packets your firewall blocked or the kernel refused, which UFW rules are in force, which other machines on your network this computer has recently talked to, and which Wi-Fi networks are in range. It never changes firewall rules and never writes traffic history to disk.
+Crosswalk is a read-only Linux terminal dashboard for your network. Eight panes on two pages show how much traffic crosses an interface, which apps are sending data out and to where, which local ports are listening and whether your firewall lets traffic reach them, which inbound packets your firewall blocked or the kernel refused, which firewall rules are in force, what has changed on the machine and its network, which other machines on your network this computer has recently talked to, and which Wi-Fi networks are in range. It never changes firewall rules and never writes traffic history to disk.
 
 The [README](../README.md) is the short version. This is the reference: the full setup, then the display, the keys, every pane, the network map, the limits, the colours and the smoke checklist.
 
@@ -10,8 +10,8 @@ The [README](../README.md) is the short version. This is the reference: the full
 
 - Linux with Rust and Cargo (edition 2024 toolchain).
 - libpcap development files and a C toolchain (`libpcap-dev` on Debian/Ubuntu, or the equivalent package for your distribution).
-- Packet-capture privileges to observe traffic. There are three ways to get them: run the binary with `sudo`, grant it two capabilities once and run it as yourself, or let Wireshark's `dumpcap` capture for it (see [Running without sudo](#running-without-sudo)).
-- UFW and `journalctl` for the default firewall source. Crosswalk never runs `ufw`; it reads UFW's configuration and rule files. Where those files are readable only by root, Listening Ports and Firewall Rules need `sudo` (see [Running without sudo](#running-without-sudo)). Firewall reporting is independent of packet capture.
+- Packet-capture privileges to observe traffic. There are three ways to get them: run the binary with `sudo`, grant it one capability once and run it as yourself, or let Wireshark's `dumpcap` capture for it (see [Running without sudo](#running-without-sudo)).
+- Optional: UFW or firewalld for the firewall panes, and `journalctl` for their blocks. Neither firewall is required. Crosswalk reads UFW's configuration and rule files and never runs `ufw`; it asks firewalld through `busctl` (part of systemd). Where the rules are readable only by root, Listening Ports and Firewall Rules need `sudo` (see [Running without sudo](#running-without-sudo)). Firewall reporting is independent of packet capture.
 - The `ip` command (from `iproute2`, present on nearly every Linux system) for the Neighbors pane.
 - Optional: the `nmcli` command (from NetworkManager) for the Wi-Fi Networks pane. Without it, or without NetworkManager running, that pane says so and the rest of Crosswalk is unaffected. It is also what makes the one key that transmits, `r` (see [Wi-Fi Networks](#wi-fi-networks)), work.
 
@@ -25,6 +25,8 @@ Tested with these versions, which are the ones installed when Crosswalk was test
 - iproute2 7.2.0
 - systemd 262
 
+firewalld was tested separately, because it is not installed on that machine: firewalld 2.4.4 on Fedora 44, in a virtual machine. UFW remains the firewall tested on the development machine.
+
 Build and inspect the supported options:
 
 ```sh
@@ -32,13 +34,13 @@ cargo build --release
 ./target/release/crosswalk --help
 ```
 
-Run with defaults (UFW provider, kernel journal source, reverse DNS on), either with `sudo`:
+Run with defaults (the firewall found at startup, kernel journal source, reverse DNS on), either with `sudo`:
 
 ```sh
 sudo ./target/release/crosswalk
 ```
 
-or as yourself, once the binary has been granted the capabilities described in [Running without sudo](#running-without-sudo):
+or as yourself, once the binary has been granted the capability described in [Running without sudo](#running-without-sudo):
 
 ```sh
 ./target/release/crosswalk
@@ -52,7 +54,7 @@ To use an explicit configuration file:
 
 (Put `sudo` in front if you run that way.)
 
-Command-line options override values in the TOML file. The terminal must be at least 110 columns by 24 rows; below that, Crosswalk shows a message giving the minimum size. Only `ufw` is currently supported as a firewall provider. For firewall setup, source selection, and diagnostics, see [docs/firewall.md](firewall.md).
+Command-line options override values in the TOML file. The terminal must be at least 110 columns by 24 rows; below that, Crosswalk shows a message giving the minimum size. Crosswalk reads UFW or firewalld, whichever it finds at startup, and `--firewall-provider` (`auto`, `ufw`, `firewalld` or `none`) overrides the choice. For firewall setup, source selection, and diagnostics, see [docs/firewall.md](firewall.md).
 
 ### Install
 
@@ -78,66 +80,65 @@ cargo uninstall crosswalk --root ~/.local
 
 Give `--root` again on each install, and on the uninstall. Cargo also writes `.crates.toml` and `.crates2.json` in the root, which here is `~/.local`.
 
-An installed copy has no capabilities. Run the `setcap` command of [Running without sudo](#running-without-sudo) on the installed path, and again after every install, because a new file does not keep the grant:
+An installed copy has no capability. Run the `setcap` command of [Running without sudo](#running-without-sudo) on the installed path, and again after every install, because a new file does not keep the grant:
 
 ```sh
-sudo setcap cap_net_raw,cap_sys_ptrace+ep ~/.cargo/bin/crosswalk
+sudo setcap cap_net_raw+ep ~/.cargo/bin/crosswalk
 ```
 
-(Use `~/.local/bin/crosswalk` if you gave `--root ~/.local`.) Without it, run the installed program with `sudo`; started without `cap_net_raw`, Crosswalk prints this command with its own absolute path.
+(Use `~/.local/bin/crosswalk` if you gave `--root ~/.local`.) Without it, run the installed program with `sudo`; started without `cap_net_raw`, and with no `dumpcap` it may run, Crosswalk prints this command with its own absolute path.
 
-Both directories belong to your account, and anyone who can write to a file with these capabilities can run their own code with them; [What you are granting](#what-you-are-granting) says more. The careful choice is the hardened install there, which copies the binary to a root-owned place before granting anything.
+Both directories belong to your account, and anyone who can write to a file with this capability can run their own code with it; [What you are granting](#what-you-are-granting) says more. The careful choice is the hardened install there, which copies the binary to a root-owned place before granting anything.
 
 ### Running without sudo
 
-Crosswalk needs privilege for two things only: capturing packets, and reading which process owns a socket that belongs to another user. Linux can grant exactly those to one program, so you do not have to run all of Crosswalk as root. Grant them to the binary once:
+Crosswalk needs privilege for one thing only: capturing packets. Linux can grant exactly that to one program, so you do not have to run all of Crosswalk as root. Grant it to the binary once:
 
 ```sh
-sudo setcap cap_net_raw,cap_sys_ptrace+ep <path to the crosswalk binary>
+sudo setcap cap_net_raw+ep <path to the crosswalk binary>
 ```
 
 Then run `crosswalk` as yourself. Crosswalk does not run `setcap` for you. Whenever it is started without `cap_net_raw`, and with no `dumpcap` it may run, it prints this command with its own absolute path.
 
-Repeat the command after each build or install: replacing the file clears its capabilities.
+Repeat the command after each build or install: replacing the file clears the grant.
 
-- `cap_net_raw` lets Crosswalk capture packets.
-- `cap_sys_ptrace` lets Crosswalk read which process owns a socket that belongs to another user. A process holding it can read and control any other process on the machine, root's included, so it is close to root-equivalent. Granting it removes the password prompt and avoids running the whole program as root, but treat it as granting root-level trust to that binary, and grant it only to a binary you trust.
+`cap_net_raw` lets Crosswalk capture packets. It is the only capability Crosswalk asks for or uses.
 
-Crosswalk holds each capability only where it uses it. It takes both out of effect before it reads its configuration, gives up `cap_net_raw` for good once the capture is open, and puts `cap_sys_ptrace` in effect only for the length of each scan of `/proc`, on the two threads that scan it. Under `sudo` nothing is changed.
+Crosswalk gives up the capability once the capture is open. Under `sudo` nothing is changed. `cap_sys_ptrace`, which versions before 1.3.0 also asked for, is no longer used; a binary still granted it gives it up.
 
-`cap_net_raw` alone is a real option: grant only that (`sudo setcap cap_net_raw+ep <path>`) and Crosswalk runs without naming other users' programs, as described next.
-
-What you see with each missing:
+What you see:
 
 - Without `cap_net_raw`, Crosswalk captures through `dumpcap` if it may run it (see [Through Wireshark's dumpcap](#through-wiresharks-dumpcap)). Otherwise it prints the message with the command, and the `dumpcap` way that fits the machine, and exits without opening the dashboard.
-- With `cap_net_raw` but without `cap_sys_ptrace`, Crosswalk runs. It names the programs you own and counts other users' traffic in App Traffic's not-attributed total. App Traffic shows a line saying that other users' programs cannot be named and that `cap_sys_ptrace` is needed, and the `apps` indicator in the header turns orange. In Listening Ports, a port owned by another user's process shows `—` for its app.
+- Run as yourself, with the grant or through `dumpcap`, Crosswalk names the programs you own and counts other users' traffic in App Traffic's not-attributed total. This is the ordinary state and not a fault: the `apps` indicator in the header is healthy and reads `apps (<user>)`, with the name of the user running Crosswalk. In Listening Ports, a port owned by another user's process shows `—` for its app.
+- Run with `sudo`, the indicator reads `apps` and the programs of every user are named.
 
 The grant has no effect if the binary is on a filesystem mounted `nosuid`, or on one that cannot store capabilities. Crosswalk then prints the same message again. `getcap <path>` shows what a file holds, and `findmnt -no OPTIONS --target <dir>` shows the mount options of the filesystem that holds `<dir>`; look for `nosuid` in the list.
 
 #### What you are granting
 
-`+ep` means the capabilities are permitted to and effective for the program as soon as it starts, with nothing passed on to the commands it runs.
+`+ep` means the capability is permitted to and effective for the program as soon as it starts, with nothing passed on to the commands it runs.
 
-The grant belongs to the file, not to you. Every user who can run the binary gets the capabilities for that process, and anyone who can write to or replace the file can run their own code with them. A binary in a build tree under a home directory can be replaced by that account, so the grant there is only as safe as that account.
+The grant belongs to the file, not to you. Every user who can run the binary gets the capability for that process, and anyone who can write to or replace the file can run their own code with it. A binary in a build tree under a home directory can be replaced by that account, so the grant there is only as safe as that account.
 
-For a hardened install, do what Wireshark does for its capture helper: copy the binary to a root-owned place, owned by root, with a dedicated group and no access for others, then grant the capabilities there.
+For a hardened install, do what Wireshark does for its capture helper: copy the binary to a root-owned place, owned by root, with a dedicated group and no access for others, then grant the capability there.
 
 ```sh
 sudo groupadd crosswalk
 sudo usermod -aG crosswalk "$USER"
 sudo install -o root -g crosswalk -m 0750 target/release/crosswalk /usr/local/bin/crosswalk
-sudo setcap cap_net_raw,cap_sys_ptrace+ep /usr/local/bin/crosswalk
+sudo setcap cap_net_raw+ep /usr/local/bin/crosswalk
 getcap /usr/local/bin/crosswalk
 ```
 
-Adding your account to the group takes effect at your next login. `getcap` should list `cap_net_raw` and `cap_sys_ptrace` with `ep`. Repeat the `install` and `setcap` commands after each new build, because `install` replaces the file and clears the grant.
+Adding your account to the group takes effect at your next login. `getcap` should list `cap_net_raw` with `ep`. Repeat the `install` and `setcap` commands after each new build, because `install` replaces the file and clears the grant.
 
 To remove the grant, run `sudo setcap -r <path>`.
 
-Two things the capabilities do not cover:
+Three things the capability does not cover:
 
 - **The kernel journal.** Firewall Blocks reads the kernel journal, so your account must already be allowed to read it, usually by membership of a group such as `systemd-journal`, `adm` or `wheel`, depending on the distribution. Without that access the pane shows one of three things, depending on how `journalctl` fails: the "Cannot read the firewall log" line when `journalctl` cannot be started, the "Firewall log is partly unreadable" line when it starts and then exits, or nothing at all when it runs but is given no kernel records, in which case an empty pane does not mean there were no blocks. The other panes keep working. Crosswalk cannot grant this access.
 - **UFW's files.** Crosswalk reads `/etc/ufw/ufw.conf`, `/etc/default/ufw`, `/etc/ufw/user.rules` and `/etc/ufw/user6.rules`. Some distributions, Debian and Ubuntu among them, keep the rule files readable only by root. Where they do, Firewall Rules and the exposure column in Listening Ports show their "cannot be read" state, and `sudo` is the way to run there. See [docs/firewall.md](firewall.md).
+- **firewalld's rules.** On many installs firewalld shows an ordinary user only its zones' names, and `sudo` is the way to see the rules. See [docs/firewall.md](firewall.md#firewalld).
 
 Running with `sudo` is still supported and behaves as before; it prints no message about capabilities.
 
@@ -153,7 +154,7 @@ Log in again afterwards, so that the group applies. `newgrp wireshark` is not en
 
 - The header's capture indicator reads `capture (dumpcap)` when packets come this way, and `capture` when Crosswalk captures by itself.
 - A binary that holds `cap_net_raw`, or runs under `sudo`, captures by itself and does not start `dumpcap`. There is no option to choose.
-- `dumpcap` only captures. Which program owns a connection is still worked out by Crosswalk, so App Traffic shows the same line about other users' programs as any run without `cap_sys_ptrace`.
+- `dumpcap` only captures. Which program owns a connection is still worked out by Crosswalk, so only your own programs are named and the header reads `apps (<user>)`, as in any run without `sudo`.
 - If `dumpcap` stops while the dashboard is open, the capture indicator turns orange and App Traffic shows "Capture through dumpcap has stopped" with the reason. The traffic already shown stays and the other panes keep working. Crosswalk does not start it again; quit and start Crosswalk again.
 - `dumpcap` is started by its absolute path from the system directories and stopped when Crosswalk quits.
 - With no `cap_net_raw` and no `dumpcap` it may run, Crosswalk prints the `setcap` command and then either the `usermod` command for the group that owns `dumpcap` on your system, or a line saying that installing `dumpcap` is the other way.
@@ -192,7 +193,7 @@ On Traffic, Bandwidth is a band across the top and App Traffic is below it, each
 
 Everything is collected for both pages all the time; only what is drawn changes. Bandwidth's chart history, Firewall Blocks' rows and the Network Events log keep building while the other page is shown, and are there when you flip to them.
 
-The header shows the name of the program, the names of the two pages with the one shown marked, and four indicators, one for each data source. The footer lists the keys that apply right now.
+The header shows the names of the two pages with the one shown marked, a count of new firewall blocks, and four indicators, one for each data source (see [Header indicators](#header-indicators)). The bottom row lists the keys that apply right now, and gives the theme's name beside its key, `t theme (synthwave)`, when it has room.
 
 ### The header's page names and count
 
@@ -214,7 +215,7 @@ While Traffic is shown, a number appears beside `Network & Firewall`. It counts 
 | `Ctrl-d` or `PgDn` / `Ctrl-u` or `PgUp` | Move down or up half the rows the pane shows, at least one row |
 | `/` | Search the focused pane |
 | `m` | Show the network map in place of the page; `m` or `Esc` closes it. Does nothing in zoom or while a search field is open (there `m` is a letter to type). See [Network map](#network-map) |
-| `t` / `T` | Show the next / previous theme, for this run only; after `terminal` comes `synthwave` again, and `T` from `synthwave` shows `terminal`. Work on both pages, in zoom and on the network map. While a search field is open they are letters to type. The header gives the name of the theme now shown. See [Colours](#colours) |
+| `t` / `T` | Show the next / previous theme, for this run only; after `terminal` comes `synthwave` again, and `T` from `synthwave` shows `terminal`. Work on both pages, in zoom and on the network map. While a search field is open they are letters to type. The bottom row gives the name of the theme now shown beside the key, when it has room. See [Colours](#colours) |
 | `i` | Show the next interface in the Bandwidth pane |
 | `n` | Turn reverse-DNS names on or off for this session (App Traffic destinations, Firewall Blocks sources including refused attempts, and Neighbors). Wi-Fi Networks has no addresses, so `n` has nothing to act on there |
 | `r` | On Wi-Fi Networks, focused or zoomed: ask NetworkManager for a Wi-Fi scan. This is the one thing in Crosswalk that causes a transmission (see [Wi-Fi Networks](#wi-fi-networks)). On any other pane it does nothing |
@@ -238,7 +239,7 @@ Each pane has its own search. A search is kept when you zoom in and out, and it 
 | Bandwidth | A taller chart, and a table of every interface with its rates and session totals. The plotted interface is marked |
 | App Traffic | Every destination (not just three), every process ID of a destination (`4312,4390,4401`) rather than the first and a count, the app's path up to 48 cells instead of 28, upload and download shown separately, and the reverse-DNS name |
 | Firewall Blocks | First-seen time, interface, direction, and the blocks the overview leaves out: those on outbound traffic and those on forwarded traffic, which show `—` for their direction. Refused attempts are listed with the blocks and show their kind |
-| Listening Ports | The full executable path and the UFW rule that decided the state (the process ID is on the overview too) |
+| Listening Ports | The full executable path and, with UFW, the rule that decided the state (the process ID is on the overview too) |
 | Firewall Rules | The text of each rule as UFW records it, without its comment |
 | Network Events | The same three columns with each event's text whole when it fits the width, where the overview cuts it at the pane's edge |
 | Neighbors | The kernel's state for each neighbour, as a word, and the interface it is on; an IPv6 address shown whole |
@@ -254,7 +255,7 @@ In zoom, the selected row stays on screen. `Tab`, `Shift-Tab`, `p` and `1`–`8`
 
 ### Bandwidth
 
-A chart of one network interface over up to the last five minutes. Outbound traffic is drawn above the centre line and inbound traffic below it. Each half is scaled to its own peak, so a quiet direction is not flattened by a busy one. The pane title shows the interface name in the highlight colour, in bold, so it stands out from the rest of the title whether or not the pane is focused. The pane prints the current rate in each direction, and each direction's peak.
+A chart of one network interface over up to the last five minutes. Outbound traffic is drawn above the centre line and inbound traffic below it. Each half is scaled to its own peak, so a quiet direction is not flattened by a busy one. Each bar is shaded by its height against the peak on screen, except in the `terminal` theme, where the bars are one flat colour. The pane title shows the interface name in the highlight colour, in bold, so it stands out from the rest of the title whether or not the pane is focused. The pane prints the current rate in each direction, and each direction's peak.
 
 On the right, a second gutter as wide as the one on the left shows the plotted interface's totals since Crosswalk started, the same session totals zoom's table shows. The first row carries `↑ total` and the bytes sent, in the outbound colour; the last row carries `↓ total` and the bytes received, in the inbound colour. The centre row carries a bar 16 cells wide, split between the outbound colour on the left and the inbound colour on the right in proportion to the two totals (in the sketch under Traffic, `▓` stands for the outbound colour). A side that has carried anything has at least one cell. Before anything has been carried the bar is drawn in the muted colour, and a total of zero is muted, as a zero rate is on the left. The plot gives up those 18 columns, so at 110 columns it shows 70 seconds of history, and when the pane is so narrow that the plot would have fewer than 20 columns the right gutter is left out. Zoom shows the same gutter beside its taller chart, and `i` shows the next interface's totals with its chart.
 
@@ -287,7 +288,7 @@ One table with two kinds of row, newest first. Each row has a KIND column that s
 
 | Kind | Meaning |
 | --- | --- |
-| `blocked` (red) | A packet UFW blocked, read from UFW log records |
+| `blocked` (red) | A packet the firewall blocked, read from the log records UFW or firewalld writes |
 | `refused` (orange) | A refused attempt: another machine sent a connection request (a TCP SYN) to a port nothing on this machine listens on, and the kernel answered with a reset (RST) |
 
 There is one row per kind, source address, port, and protocol. A repeat raises the row's count (shown as `×3`) and updates its last-seen time without moving it. A new source, port, or protocol adds a row at the top. Crosswalk keeps the newest 1,000 rows in all: firewall blocks and refused attempts together, inbound, outbound and forwarded together, and the oldest row of either kind goes first.
@@ -300,13 +301,15 @@ Refused attempts are seen in captured packets, so they need packet capture to be
 
 When the pane is narrow, the last-seen time is the first column dropped, then the hit count and the port. Zoom always shows them.
 
-Block rows come from UFW log records. UFW logging has to be on, and logged blocks can be rate-limited, so this pane is not an exact count of blocked packets. Refused attempts do not depend on UFW logging. See [docs/firewall.md](firewall.md).
+Block rows come from the firewall's log records, so with no supported firewall there are none and the pane says so. With UFW, UFW logging has to be on, and logged blocks can be rate-limited, so this pane is not an exact count of blocked packets. Refused attempts do not depend on firewall logging. See [docs/firewall.md](firewall.md).
+
+With firewalld, block rows appear only when firewalld logs denied packets, which it does not do as installed; the pane says so and gives the command. See [docs/firewall.md](firewall.md#firewalld).
 
 ### Listening Ports
 
-Every TCP port in the listening state, and every bound UDP port below the kernel's ephemeral port range (read from `/proc/sys/net/ipv4/ip_local_port_range`, usually 32768 and up), for IPv4 and IPv6. Each row shows the port and protocol, the app that owns it (its short name: the executable's file name, or, when that is only a version number, as with `.../claude/versions/2.1.296`, the folder it is installed under, `claude`, skipping folders called `versions`, `version`, `releases` or `bin`), the owning process's ID (`—` when no process owns the port), the address it is bound to, and its firewall state. The columns are `PORT`, `APP`, `PID`, `BIND` and `FIREWALL`. The app takes the room that is left; the pane is half the width, so there is no room for a path, and zoom has a `PATH` column. When the pane is narrow, `PID` is dropped first, then `BIND`, `APP` and `FIREWALL`; `PORT` goes last. Zoom is unchanged. Rows are ordered by exposure: `open` first, then the unknown ones (UFW off, or its rules unreadable), then `limited`, `blocked` and `local`; within one state by port number, then protocol, then bind address. This holds on the overview and in zoom, and with UFW off the ports are simply by port number with the local ones last. Network Events logs a port when it starts or stops listening whatever its place in the list. Rows follow changes on the machine within a few seconds. Rules are re-read about every five seconds.
+Every TCP port in the listening state, and every bound UDP port below the kernel's ephemeral port range (read from `/proc/sys/net/ipv4/ip_local_port_range`, usually 32768 and up), for IPv4 and IPv6. Each row shows the port and protocol, the app that owns it (its short name: the executable's file name, or, when that is only a version number, as with `.../claude/versions/2.1.296`, the folder it is installed under, `claude`, skipping folders called `versions`, `version`, `releases` or `bin`), the owning process's ID (`—` when no process owns the port), the address it is bound to, and its firewall state. The columns are `APP`, `PID`, `BIND`, `PORT` and `FIREWALL`, from the left. `APP` and `PID` are left-justified; `BIND`, `PORT` and `FIREWALL` are right-justified, titles included, so the firewall states end on one edge. The app takes the room that is left; the pane is half the width, so there is no room for a path, and zoom has a `PATH` column. When the pane is narrow, `PID` is dropped first, then `BIND`, `APP` and `FIREWALL`; `PORT` goes last. Zoom reads `APP`, `PID`, `BIND`, `PORT`, `FIREWALL`, `RULE` and `PATH`, with `RULE` and `PATH` left-justified. Rows are ordered by exposure: `open` first, then the unknown ones (the cells that start with `?`), then `limited`, `blocked` and `local`; within one state by port number, then protocol, then bind address. This holds on the overview and in zoom, and when every exposure is unknown, as with UFW off or no firewall, the ports are simply by port number with the local ones last. Network Events logs a port when it starts or stops listening whatever its place in the list. Rows follow changes on the machine within a few seconds. Rules are re-read about every five seconds.
 
-The four states:
+The four states, as UFW's rules decide them:
 
 | State | Meaning |
 | --- | --- |
@@ -319,9 +322,11 @@ By default open is red, limited orange, blocked green, and the rest grey.
 
 When a rule that allows from anywhere and a rule that denies from anywhere both match, the one that comes first in UFW's rule file decides.
 
-**Exposure is judged from UFW's rules only.** Crosswalk does not know about your router, a cloud provider's firewall or security group, or nftables or iptables rules written by hand outside UFW. A port marked `blocked` may still be reachable through one of those, and a port marked `open` may be blocked by one.
+**Exposure is judged from the rules of the firewall Crosswalk reads only.** Crosswalk does not know about your router, a cloud provider's firewall or security group, or nftables or iptables rules written by hand outside UFW or firewalld. A port marked `blocked` may still be reachable through one of those, and a port marked `open` may be blocked by one.
 
 Crosswalk never runs `ufw`. It reads whether UFW is enabled from `/etc/ufw/ufw.conf`, the default policies from `/etc/default/ufw`, and the rules from `/etc/ufw/user.rules` and `/etc/ufw/user6.rules`. If UFW is off, the column reads `? ufw off`. If the rules cannot be read, it reads `? unreadable`. In both cases no port is marked `open` or `blocked`, and the pane says why. Until the first read finishes, the column shows `· …`. Loopback ports are marked `local` in every case. See [docs/firewall.md](firewall.md) to fix a read problem.
+
+With firewalld, a port is judged by the zones of the interfaces it listens on: `open` when all of them let it in, `blocked` when none does, and `limited` in between. The other cells that start with `?` (`? no firewall`, `? fwd off`, `? not readable`, `? unknown`) are listed in [docs/firewall.md](firewall.md#listening-ports-and-firewall-rules-need-the-rule-files).
 
 ### Firewall Rules
 
@@ -343,6 +348,8 @@ The UFW rules that filter this machine's own traffic, in the order UFW applies t
 A rule that exists identically for IPv4 and IPv6 is one row. A rule for one family only is marked `v4` or `v6` after its direction, such as `in v6`. Forwarding rules (`ufw route`) are not listed, and neither are rules written outside UFW. A rule's comment (`ufw allow 22/tcp comment 'ssh'`) is not shown; the rule is listed as it would be without one. Zoom adds the text of each rule as UFW records it, without its comment.
 
 Rules are re-read about every five seconds. When UFW is off the pane shows one line saying so and no rules; when the rules cannot be read it shows one line saying that and pointing to [docs/firewall.md](firewall.md). With UFW active and no rules it shows the defaults and `no rules`.
+
+With firewalld the pane lists each active zone instead: its name, what it applies to and its default, then the services and ports it lets in and its rich rules. See [docs/firewall.md](firewall.md#firewalld).
 
 ### Network Events
 
@@ -421,7 +428,7 @@ The columns:
 | Column | Meaning |
 | --- | --- |
 | `NETWORK` | The network name, which takes the room the other columns leave. `●` before the name marks the access point this machine is connected to. A network that broadcasts no name shows `(hidden)` in grey |
-| `SIGNAL` | Four bars and the strength as a number, 0 to 100. 80 and above lights four bars, 55 to 79 three, 30 to 54 two, and anything lower one |
+| `SIGNAL` | Four bars and the strength as a number, 0 to 100. 80 and above lights four bars, 55 to 79 three, 30 to 54 two, and anything lower one. The bars are in the healthy colour at 55 and above, the warning colour from 30 to 54, and the danger colour below 30 |
 | `SECURITY` | What NetworkManager reports, such as `WPA2` or `WPA3`. An open network shows `open` in the warning colour |
 | `CHANNEL` | The pane's last column, left-justified: the channel number right-justified in three cells, then ` · ` and the band, written `2.4G`, `5G` or `6G`, such as `  1 · 2.4G`, ` 11 · 2.4G` and `161 · 5G`, so the dots and the bands of all rows start in the same column. Below 3000 MHz is 2.4 GHz, below 5925 MHz is 5 GHz, and anything above is 6 GHz |
 
@@ -446,16 +453,18 @@ Any other `nmcli` failure on the periodic read is shown as `Wi-Fi unavailable: n
 
 ### Header indicators
 
-Four dots in the header show the state of each data source:
+Four dots in the header show the state of each data source. Each has a label, and three of the labels carry a detail in brackets:
 
 | Indicator | Source |
 | --- | --- |
-| `capture` | Packet capture, used by App Traffic |
-| `firewall` | The UFW log source, used by Firewall Blocks |
+| `capture` or `capture (dumpcap)` | Packet capture, used by App Traffic: by Crosswalk itself, or through `dumpcap` |
+| `firewall (ufw)`, `firewall (fwd)` or `firewall (none)` | The firewall being read, UFW, firewalld or none, and its block log, used by Firewall Blocks. |
 | `interfaces` | Kernel interface counters, used by Bandwidth |
-| `apps` | Matching sockets to processes, used by App Traffic and Listening Ports |
+| `apps` or `apps (<user>)` | Matching sockets to processes, used by App Traffic and Listening Ports. `apps (<user>)` means only that user's programs are named, which is the ordinary state without `sudo`; `apps` means every user's are, as under `sudo` |
 
-A green dot means the source is working. An orange dot means it is degraded, out of date, or switched off (for example UFW logging is off). A red dot means it is unavailable or stopped. A grey dot means it has not reported yet.
+A green dot means the source is working. An orange dot means it is degraded, out of date, or switched off (for example UFW logging is off, or firewalld is not running). A red dot means it is unavailable or stopped. A grey dot means it has not reported yet; `firewall (none)` is grey too, because having no supported firewall is not a fault.
+
+While packets were dropped in the last ten seconds, the capture dot is orange and its label counts them, `capture (340 dropped)`; App Traffic is incomplete while it shows. When the row is too narrow, the user name in `apps (<user>)` is cut short with `…`.
 
 When a source has a problem, the pane that depends on it shows one plain line saying what is wrong and where to look. The other panes keep working.
 
@@ -525,15 +534,15 @@ Text too long for the box is cut with `…`.
 ## Limits you should know about
 
 - Packet capture is non-promiscuous metadata capture on Linux's `any` device and needs the Linux cooked v2 (SLL2) link type. Packet payloads are discarded.
-- Process ownership is best effort. Connections shorter than about a tenth of a second, and DNS lookups, are counted in the not-attributed total, as are restricted `/proc`, shared sockets, traffic from other network namespaces, and replies to an unconnected UDP socket. A connection's owner is remembered for two minutes after its socket was last seen, so the packets that finish a closed connection stay with its app. Crosswalk never guesses an app from a port.
+- Process ownership is best effort. Connections shorter than about a tenth of a second, and DNS lookups, are counted in the not-attributed total, as are other users' programs when Crosswalk runs without `sudo`, restricted `/proc`, shared sockets, traffic from other network namespaces, and replies to an unconnected UDP socket. A connection's owner is remembered for two minutes after its socket was last seen, so the packets that finish a closed connection stay with its app. Crosswalk never guesses an app from a port.
 - The minimum terminal size is 110 columns by 24 rows. Each page has room for its panes at that size, but the other page is not visible: the header count is the only sign of new firewall blocks while Traffic is shown, and a machine that keeps retrying a refused connection keeps that count high.
 - Wi-Fi Networks is only as fresh as NetworkManager's own scanning, because Crosswalk asks for a scan only when you press `r`; the periodic read never does, and `r` is the one case in which Crosswalk causes a transmission. Access points are remembered only until Crosswalk exits, and at most 200. It needs NetworkManager and the `nmcli` command; iwd or wpa_supplicant alone gives the unavailable line. It lists, and does not connect to or manage, networks, and keeps no signal history.
 - The network map keeps up to 4,096 devices, the same limit as the neighbours Network Events remembers, and keeps them only until Crosswalk exits; devices past 4,096 are not added to the map. While it is open, Crosswalk asks the resolver for the name of the gateway and of the one address each device's box shows, so it is asked for about as many addresses as there are boxes; up to 64 wait in its queue at a time and the rest follow as answers come back. The resolver remembers 512 names. With more than 512 devices on the map, the names it has to forget are asked for again as the map is drawn, so the resolver keeps working through the list for as long as the map is open and some boxes show an address or hardware address where a name was a moment before. It reads this host's hardware address from `/sys/class/net` when the map opens and when the default route moves to another interface.
-- A captured packet and a UFW block record are separate observations. Crosswalk does not match them up, and silence in Firewall Blocks does not show that nothing was blocked.
+- A captured packet and a firewall block record are separate observations. Crosswalk does not match them up, and silence in Firewall Blocks does not show that nothing was blocked.
 - App Traffic uses captured traffic, and Bandwidth uses kernel counters, so their totals can differ. VPNs and bridges can show the same traffic on more than one interface. Packets passing through this machine and other machines' traffic are not described in App Traffic or Bandwidth; the firewall blocks of forwarded packets are listed in zoomed Firewall Blocks only.
 - Reverse DNS is on by default: Crosswalk asks the system resolver for the name of each remote address it looks up, which sends those addresses to your configured DNS server. Turn it off with `--reverse-dns false` or `reverse_dns = false`. Press `n` to turn names off or on for the session; it covers Firewall Blocks sources and Neighbors as well as App Traffic destinations, and has nothing to act on in Wi-Fi Networks. The configured value is the starting state and the key does not change the config file. Lookups are made only for panes on the page shown, or for the zoomed pane, so names on the other page can take a moment to appear after you flip to it. Within those panes, Firewall Blocks and Neighbors look up only the rows the screen can show, while App Traffic looks up every destination of every app, including those folded behind `+N more`. A name is the system's reverse (PTR) record for the address. It is not the name the app asked for. A failed lookup leaves the address shown. Lookups run in the background and do not slow the display.
 - Everything is kept in memory for the current run and discarded on exit, except what `--attribution-log` writes. The chart keeps 300 one-second samples per interface (five minutes). App Traffic keeps up to 4,096 destinations. Firewall Blocks keeps 1,000 rows: firewall blocks and refused attempts, inbound, outbound and forwarded, together. Network Events keeps 500 events. Nothing about traffic is written to disk.
-- The screen redraws every 40 ms, and data is sampled once a second. Listening sockets and the neighbour table are re-read every 2 seconds, and UFW's rules and NetworkManager's Wi-Fi list every 5. A change is logged in Network Events when the read that shows it arrives, so one that comes and goes between two reads is missed. This machine's addresses are read about once a second, and App Traffic follows them: a packet counts as this machine's once the reading that shows its address has been taken, and packets that arrive before that reading are not counted.
+- The screen redraws every 40 ms, and data is sampled once a second. Listening sockets and the neighbour table are re-read every 2 seconds, and the firewall's rules and NetworkManager's Wi-Fi list every 5. A change is logged in Network Events when the read that shows it arrives, so one that comes and goes between two reads is missed. This machine's addresses are read about once a second, and App Traffic follows them: a packet counts as this machine's once the reading that shows its address has been taken, and packets that arrive before that reading are not counted.
 
 ## Colours
 
@@ -548,7 +557,7 @@ Crosswalk has twenty-five built-in themes, in this order, which is the order `t`
 
 All but `terminal` need 24-bit colour.
 
-Choose one with `name` in the `[theme]` table of the config file (`name = "nord"`) or with `--theme nord` on the command line; the command line wins over the file. A name that is not one of the twenty-five stops startup with an error listing them. Press `t` while running to show the next theme, in the order above, and `T` to show the previous one; they start from the theme Crosswalk was started with. The header shows the name of the theme now shown, in front of the status indicators, on both pages, in zoom and on the map. Nothing is written to the config file, so put that name in `[theme]` to keep a theme.
+Choose one with `name` in the `[theme]` table of the config file (`name = "nord"`) or with `--theme nord` on the command line; the command line wins over the file. A name that is not one of the twenty-five stops startup with an error listing them. Press `t` while running to show the next theme, in the order above, and `T` to show the previous one; they start from the theme Crosswalk was started with. The bottom row shows the name of the theme now shown beside its key, `t theme (nord)`, when the row has room for it. Nothing is written to the config file, so put that name in `[theme]` to keep a theme.
 
 ### Overriding colours
 
@@ -561,7 +570,7 @@ To change single colours, add them to the `[theme]` table and give any of these 
 | `muted` | `#8a7aaa` | Borders of unfocused panes, column titles, the chart centre line, idle rows, `(hidden)` networks, remembered access points, the page not shown in the header, the network map's lines and the boxes of devices no longer in the neighbour table, secondary text, and the selected row's background |
 | `inbound` | `#00f0ff` | Inbound traffic: the lower half of the chart, download rates, and the headings in the help popup |
 | `outbound` | `#ff2a8a` | Outbound traffic: the upper half of the chart and upload rates |
-| `accent` | `#b05cff` | The focused pane's border and title, the program name, and the page shown in the header |
+| `accent` | `#b05cff` | The focused pane's border and title, and the page shown in the header |
 | `warning` | `#ff9a3c` | `limited` ports, warning events in Network Events, `limit` rules, refused attempts, rows of `failed` and `incomplete` neighbours, `open` networks in Wi-Fi Networks, a refused scan, the header's block count, degraded indicators, and notices |
 | `danger` | `#ff3860` | `open` ports, danger events in Network Events (a neighbour's hardware address changing), firewall blocks, `deny` and `reject` rules, and failed indicators |
 | `ok` | `#3cff9a` | Healthy indicators, blocked ports in Listening Ports, and `allow` rules |
@@ -577,13 +586,13 @@ An unknown colour name or a value that is not `#rrggbb` stops startup with an er
 
 ## Smoke checklist
 
-Run this on a Linux machine where you can use packet-capture privileges. Steps 1 to 5 create only local loopback HTTP traffic and do not change firewall rules or UFW logging; step 6 is the exception. Record unavailable privileges or absent block events as limits; do not manufacture firewall events by changing policy.
+Run this on a Linux machine where you can use packet-capture privileges. Steps 1 to 5 create only local loopback HTTP traffic and do not change firewall rules or firewall logging; step 6 is the exception. Record unavailable privileges or absent block events as limits; do not manufacture firewall events by changing policy.
 
-1. Build with `cargo build --release`, then start `sudo ./target/release/crosswalk`, or grant the capabilities as in [Running without sudo](#running-without-sudo) and start `./target/release/crosswalk` as yourself. Run the check both ways if you can; started without `cap_net_raw`, Crosswalk should print the `setcap` command and exit. Confirm Traffic shows Bandwidth, App Traffic, Listening Ports and Firewall Rules, and that `5` brings up Network & Firewall with its four panes. Check that the Bandwidth title shows the interface's address, and `gw` and `dns` where the machine has them. If capture startup reports a permission or SLL2 error, record it rather than treating empty panes as zero traffic.
+1. Build with `cargo build --release`, then start `sudo ./target/release/crosswalk`, or grant `cap_net_raw` as in [Running without sudo](#running-without-sudo) and start `./target/release/crosswalk` as yourself. Run the check both ways if you can; started without `cap_net_raw`, and with no `dumpcap` it may run, Crosswalk should print the `setcap` command and exit. Confirm Traffic shows Bandwidth, App Traffic, Listening Ports and Firewall Rules, and that `5` brings up Network & Firewall with its four panes. Check that the Bandwidth title shows the interface's address, and `gw` and `dns` where the machine has them. If capture startup reports a permission or SLL2 error, record it rather than treating empty panes as zero traffic.
 2. Record `ip -s link show dev lo`, then in another terminal start a local server: `python3 -m http.server 8765 --bind 127.0.0.1`. Request it repeatedly with `curl --noproxy '*' http://127.0.0.1:8765/` while watching the panes. Compare the loopback kernel counter with Crosswalk's interface rates and look for captured bytes and process attribution (the short-lived client may be unknown). Run `ip -s link show dev lo` again afterward. Kernel counters include both directions and may not equal IP-layer capture lengths.
 3. If the host has IPv6 loopback, start a server bound to `::1` on another port and request `http://[::1]:PORT/`. Otherwise record IPv6 live traffic as unavailable. Confirm the numeric IPv6 address remains visible; reverse DNS is optional.
 4. Use keys `1`–`8`, `Tab`, `Shift-Tab` and `p`, and check that the page shown follows the focused pane; zoom each pane with `Enter` and return with `Esc`. Resize below and above 110×24. Check search (`/`, type, Enter, then Esc on the overview to clear it) and confirm the terminal is restored after quitting with `q`.
-5. Check the `firewall` indicator and the Firewall Blocks pane. Confirm they report available, awaiting events, disabled, or unavailable honestly. Then check that Listening Ports shows `? ufw off` or `? unreadable` instead of guessing when UFW is off or its rules cannot be read. Do not change firewall settings to create a block; if no real block occurs during the check, record block-event behavior as not observed live. Check that Network Events starts empty and that a change after startup, such as a new neighbour appearing, adds a line without making the header count move. Check that Firewall Rules shows the default policies and your UFW rules (or one line saying UFW is off or unreadable), and that Neighbors lists the router or other machines you have recently talked to, with the `ip` command present. Check that Wi-Fi Networks lists the access points `nmcli device wifi list` shows, with your connection marked, or says plainly that `nmcli` is missing, NetworkManager is not running, or there is no Wi-Fi device. Stay on Traffic while something is refused or blocked, and check that the count beside Network & Firewall rises and goes away when you open that page.
+5. Check the `firewall` indicator and the Firewall Blocks pane. Confirm they report available, awaiting events, disabled, or unavailable honestly. Then check that Listening Ports shows a cell that starts with `?` instead of guessing when the firewall is off, not found or not readable. Do not change firewall settings to create a block; if no real block occurs during the check, record block-event behavior as not observed live. Check that Network Events starts empty and that a change after startup, such as a new neighbour appearing, adds a line without making the header count move. Check that Firewall Rules shows the default policies and your UFW rules, or firewalld's active zones (or one line saying that the firewall is off, unreadable or not found), and that Neighbors lists the router or other machines you have recently talked to, with the `ip` command present. Check that Wi-Fi Networks lists the access points `nmcli device wifi list` shows, with your connection marked, or says plainly that `nmcli` is missing, NetworkManager is not running, or there is no Wi-Fi device. Stay on Traffic while something is refused or blocked, and check that the count beside Network & Firewall rises and goes away when you open that page.
 
 6. Optional, and the one step that makes Crosswalk transmit: with Wi-Fi Networks focused press `r`. Check that `scan requested…` appears within about a second and that the list is then refreshed without further keys, and that pressing `r` again straight away shows `scan refused: a scan was just done` for a few seconds. Check that `r` does nothing on another pane. Also check that an access point NetworkManager stops listing stays in the pane, muted, with `seen` and its age.
 

@@ -19,6 +19,8 @@ pub struct InterfaceAddress {
 pub struct InterfaceCounters {
     pub name: String,
     pub addresses: Vec<InterfaceAddress>,
+    /// `IFF_UP` is set: not down by an administrator. Says nothing of carrier.
+    pub is_up: bool,
     pub received_bytes: u64,
     pub transmitted_bytes: u64,
 }
@@ -68,6 +70,7 @@ pub struct InterfaceMeasurement {
     pub session_received_bytes: u64,
     pub session_transmitted_bytes: u64,
     pub status: InterfaceStatus,
+    pub is_up: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -184,6 +187,7 @@ impl<S: InterfaceSource> InterfaceCounterCollector<S> {
                 };
 
                 state.measurement.addresses = current.addresses;
+                state.measurement.is_up = current.is_up;
                 state.measurement.download_bytes_per_second = rate(received_delta, elapsed);
                 state.measurement.upload_bytes_per_second = rate(transmitted_delta, elapsed);
                 state.measurement.session_received_bytes = state
@@ -205,6 +209,7 @@ impl<S: InterfaceSource> InterfaceCounterCollector<S> {
                         measurement: InterfaceMeasurement {
                             name: current.name,
                             addresses: current.addresses,
+                            is_up: current.is_up,
                             download_bytes_per_second: 0.0,
                             upload_bytes_per_second: 0.0,
                             session_received_bytes: 0,
@@ -293,12 +298,12 @@ impl InterfaceSource for LinuxInterfaceSource {
                 ),
             )
         })?;
-        let addresses = interface_addresses()?;
+        let live = live_interfaces()?;
 
         contents
             .lines()
             .skip(2)
-            .map(|line| parse_counter_line(line, &addresses))
+            .map(|line| parse_counter_line(line, &live))
             .collect()
     }
 
@@ -353,7 +358,7 @@ fn parse_default_route(table: &str) -> Option<DefaultRoute> {
 
 fn parse_counter_line(
     line: &str,
-    addresses: &HashMap<String, Vec<InterfaceAddress>>,
+    live: &HashMap<String, LiveInterface>,
 ) -> io::Result<InterfaceCounters> {
     let (name, values) = line.split_once(':').ok_or_else(|| {
         io::Error::new(
@@ -370,8 +375,11 @@ fn parse_counter_line(
     }
 
     let name = name.trim().to_owned();
+    let found = live.get(&name);
     Ok(InterfaceCounters {
-        addresses: addresses.get(&name).cloned().unwrap_or_default(),
+        addresses: found.map(|live| live.addresses.clone()).unwrap_or_default(),
+        // An interface the system does not list is not known to be down.
+        is_up: found.is_none_or(|live| live.is_up),
         name,
         received_bytes: parse_counter(values[0])?,
         transmitted_bytes: parse_counter(values[8])?,
@@ -387,21 +395,31 @@ fn parse_counter(value: &str) -> io::Result<u64> {
     })
 }
 
-fn interface_addresses() -> io::Result<HashMap<String, Vec<InterfaceAddress>>> {
+/// What `getifaddrs` says of one interface.
+struct LiveInterface {
+    is_up: bool,
+    addresses: Vec<InterfaceAddress>,
+}
+
+fn live_interfaces() -> io::Result<HashMap<String, LiveInterface>> {
     let mut head = ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
         return Err(io::Error::last_os_error());
     }
     let addresses = InterfaceAddressList(head);
-    let mut by_interface = HashMap::<String, Vec<InterfaceAddress>>::new();
+    let mut by_interface = HashMap::<String, LiveInterface>::new();
     let mut current = addresses.0;
 
     while !current.is_null() {
         let address = unsafe { &*current };
+        let name = unsafe { CStr::from_ptr(address.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let live = by_interface.entry(name).or_insert_with(|| LiveInterface {
+            is_up: address.ifa_flags & libc::IFF_UP as u32 != 0,
+            addresses: Vec::new(),
+        });
         if !address.ifa_addr.is_null() {
-            let name = unsafe { CStr::from_ptr(address.ifa_name) }
-                .to_string_lossy()
-                .into_owned();
             let family = unsafe { (*address.ifa_addr).sa_family as i32 };
             let netmask = address.ifa_netmask;
             let found = match family {
@@ -434,7 +452,7 @@ fn interface_addresses() -> io::Result<HashMap<String, Vec<InterfaceAddress>>> {
                 _ => None,
             };
             if let Some(found) = found {
-                by_interface.entry(name).or_default().push(found);
+                live.addresses.push(found);
             }
         }
         current = address.ifa_next;

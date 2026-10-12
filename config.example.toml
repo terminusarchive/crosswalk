@@ -1,6 +1,8 @@
-# Crosswalk's defaults are UFW, the kernel journal, and reverse DNS enabled.
+# Crosswalk's defaults are the firewall it finds, the kernel journal, and reverse DNS enabled.
 # Set reverse_dns = false to start with names off; press n in the UI to toggle.
-firewall_provider = "ufw"
+# auto picks firewalld when it is running, else UFW, else whichever is installed, at startup;
+# ufw, firewalld or none overrides that.
+firewall_provider = "auto"
 ufw_source = "journal"
 reverse_dns = true
 

@@ -5,10 +5,11 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::AtomicBool, mpsc::sync_channel},
+    time::Duration,
 };
 
 use crosswalk::collect::attribution::Listener;
-use crosswalk::config::UfwSource;
+use crosswalk::config::{Config, UfwSource};
 
 mod common;
 use common::listener;
@@ -16,10 +17,11 @@ use common::listener;
 use crosswalk::{
     collect::capture::{Direction, Protocol},
     firewall::{
-        Exposure, FileInput, FirewallEvent, FirewallHealth, FirewallInput, FirewallOutcome,
-        FirewallProvider, FirewallStatus, InputRead, JournalInput, JournalProcess, LineReader,
-        Network, Policy, Rule, RuleAction, RuleDirection, RuleSnapshot, UfwProvider,
-        checked_ufw_health, create_with_conf, exposure,
+        Choice, Exposure, Facts, FileInput, FirewallEvent, FirewallHealth, FirewallInput,
+        FirewallProvider, FirewallStatus, FirewalldProvider, InputRead, JournalInput,
+        JournalProcess, LineReader, Network, Policy, Rule, RuleAction, RuleDirection, RuleSnapshot,
+        Running, UfwProvider, checked_ufw_health, choose, create_provider_with, create_with_conf,
+        exposure,
     },
 };
 
@@ -74,7 +76,6 @@ fn normalizes_ipv4_ipv6_and_incomplete_ufw_blocks_only() {
     ]);
 
     assert_eq!(events.len(), 3);
-    assert_eq!(events[0].outcome, FirewallOutcome::Blocked);
     assert_eq!(events[0].timestamp.as_deref(), Some("1791460800000000"));
     assert_eq!(events[0].direction, Some(Direction::Inbound));
     assert_eq!(events[0].interface.as_deref(), Some("eth0"));
@@ -103,18 +104,14 @@ fn normalizes_ipv4_ipv6_and_incomplete_ufw_blocks_only() {
     assert_eq!(events[2].source.port, None);
     assert_eq!(events[2].destination.ip, None);
     assert_eq!(events[2].destination.port, None);
-    assert_eq!(events[2].process, None);
     assert_eq!(status.health, FirewallHealth::Available);
-    assert_eq!(status.records_read, 4);
-    assert_eq!(status.events_emitted, 3);
 }
 
 #[test]
-fn reports_malformed_input_errors_awaiting_state_and_queue_loss() {
+fn reports_malformed_input_and_errors_and_awaiting_state() {
     let (events, malformed) = poll_lines(&["kernel: [UFW BLOCK] not-key-values"]);
     assert!(events.is_empty());
     assert!(matches!(malformed.health, FirewallHealth::Degraded(_)));
-    assert_eq!(malformed.malformed_records, 1);
 
     let (input, _) = ScriptedInput::new([Ok(InputRead::Idle)]);
     let mut awaiting = UfwProvider::new(input, FirewallHealth::AwaitingEvents, 1, 128).unwrap();
@@ -133,17 +130,6 @@ fn reports_malformed_input_errors_awaiting_state_and_queue_loss() {
         failed.poll(&sender, &AtomicBool::new(false)).health,
         FirewallHealth::Degraded(message) if message.contains("inaccessible")
     ));
-
-    let block = "[UFW BLOCK] IN=eth0 OUT= SRC=198.51.100.8 DST=192.0.2.10 PROTO=TCP";
-    let (input, _) = ScriptedInput::new([
-        Ok(InputRead::Record(block.to_owned())),
-        Ok(InputRead::Record(block.to_owned())),
-    ]);
-    let mut saturated = UfwProvider::new(input, FirewallHealth::AwaitingEvents, 2, 1024).unwrap();
-    let (sender, _receiver) = sync_channel(1);
-    let status = saturated.poll(&sender, &AtomicBool::new(false));
-    assert_eq!(status.events_emitted, 1);
-    assert_eq!(status.delivery_dropped, 1);
 }
 
 fn conf_health(conf: &str) -> FirewallHealth {
@@ -459,11 +445,8 @@ impl FirewallProvider for OtherProvider {
 
     fn status(&self) -> FirewallStatus {
         FirewallStatus {
+            name: "ufw",
             health: FirewallHealth::Available,
-            records_read: 1,
-            events_emitted: 1,
-            malformed_records: 0,
-            delivery_dropped: 0,
         }
     }
 }
@@ -522,7 +505,7 @@ fn tcp(port: u16) -> Listener {
 }
 
 fn exposure_for(incoming: &str, v4: &str, l: &Listener) -> Exposure {
-    exposure(l, &snapshot(incoming, v4, ""))
+    exposure(l, &snapshot(incoming, v4, ""), None)
 }
 
 fn kind(e: &Exposure) -> &'static str {
@@ -908,7 +891,10 @@ fn loopback_binds_are_local_whatever_the_rules() {
     let deny = tuple("deny tcp 631 0.0.0.0/0 any 0.0.0.0/0 in");
     assert_eq!(exposure_for(ACTIVE_DENY, &deny, &l), Exposure::Local);
     let l6 = listener(Protocol::Tcp, "::1", 631);
-    assert_eq!(exposure(&l6, &RuleSnapshot::Inactive), Exposure::Local);
+    assert_eq!(
+        exposure(&l6, &RuleSnapshot::Inactive, None),
+        Exposure::Local
+    );
 }
 
 #[test]
@@ -1002,11 +988,11 @@ fn ipv6_listeners_are_judged_by_the_ipv6_rules() {
     let v6 = tuple("allow tcp 80 ::/0 any ::/0 in");
     let l6 = listener(Protocol::Tcp, "::", 80);
     assert_eq!(
-        kind(&exposure(&l6, &snapshot(ACTIVE_DENY, "", &v6))),
+        kind(&exposure(&l6, &snapshot(ACTIVE_DENY, "", &v6), None)),
         "open"
     );
     assert_eq!(
-        kind(&exposure(&tcp(80), &snapshot(ACTIVE_DENY, "", &v6))),
+        kind(&exposure(&tcp(80), &snapshot(ACTIVE_DENY, "", &v6), None)),
         "blocked"
     );
 }
@@ -1014,11 +1000,11 @@ fn ipv6_listeners_are_judged_by_the_ipv6_rules() {
 #[test]
 fn unavailable_or_inactive_rules_leave_exposure_unknown() {
     assert!(matches!(
-        exposure(&tcp(80), &RuleSnapshot::Inactive),
+        exposure(&tcp(80), &RuleSnapshot::Inactive, None),
         Exposure::Unknown(_)
     ));
     assert!(matches!(
-        exposure(&tcp(80), &RuleSnapshot::Unavailable("no access".to_owned())),
+        exposure(&tcp(80), &RuleSnapshot::Unavailable("no access".to_owned()), None),
         Exposure::Unknown(reason) if reason == "no access"
     ));
 }
@@ -1224,4 +1210,157 @@ fn a_commented_tuple_with_one_field_too_few_is_unreadable_with_the_usual_message
         reason.contains("expected 7 or 9 fields, found 6"),
         "{reason}"
     );
+}
+
+const MISSING_CONF: &str = "/nonexistent/ufw.conf";
+
+fn provider_for(option: &str, conf: &Path, log: &Path) -> Box<dyn FirewallProvider> {
+    let config = Config::load_from([
+        "crosswalk",
+        "--firewall-provider",
+        option,
+        "--ufw-source",
+        &format!("file:{}", log.display()),
+    ])
+    .unwrap();
+    create_provider_with(&config, conf, unreachable_firewalld(), &[])
+}
+
+/// A firewalld provider whose `busctl` cannot be started, and no firewalld program installed:
+/// the machine of feature 045, whatever the host holds.
+fn unreachable_firewalld() -> FirewalldProvider {
+    FirewalldProvider::with_busctl(
+        PathBuf::from("/nonexistent/busctl"),
+        Duration::from_secs(1),
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+fn blocks_and_rules_through(
+    option: &str,
+    conf: &Path,
+) -> (Vec<FirewallEvent>, FirewallStatus, RuleSnapshot) {
+    let log = TempFile::new("");
+    let mut provider = provider_for(option, conf, log.path());
+    log.append("[UFW BLOCK] IN=eth0 OUT= SRC=198.51.100.1 DST=192.0.2.1 PROTO=TCP");
+    let (sender, receiver) = sync_channel(32);
+    let status = provider.poll(&sender, &AtomicBool::new(false));
+    let rules = provider.rules();
+    (receiver.try_iter().collect(), status, rules)
+}
+
+#[test]
+fn auto_behaves_as_ufw_when_the_configuration_file_exists() {
+    for conf in [
+        "ENABLED=yes\nLOGLEVEL=low\n",
+        "ENABLED=no\n",
+        "ENABLED=yes\nLOGLEVEL=off\n",
+        "ENABLED=yes\n",
+    ] {
+        let conf = TempFile::new(conf);
+        let auto = blocks_and_rules_through("auto", conf.path());
+        let ufw = blocks_and_rules_through("ufw", conf.path());
+        assert_eq!(auto.0.len(), ufw.0.len());
+        assert_eq!(auto.1, ufw.1);
+        assert_eq!(auto.2, ufw.2);
+    }
+}
+
+#[test]
+fn auto_is_the_none_provider_when_the_configuration_file_does_not_exist() {
+    let (events, status, rules) = blocks_and_rules_through("auto", Path::new(MISSING_CONF));
+
+    assert!(events.is_empty());
+    assert_eq!(status.health, FirewallHealth::NoFirewall);
+    assert_eq!(rules, RuleSnapshot::NoFirewall);
+}
+
+#[test]
+fn none_is_the_none_provider_whatever_exists_and_ufw_is_ufw_whatever_exists() {
+    let conf = TempFile::new("ENABLED=yes\nLOGLEVEL=low\n");
+    let none = blocks_and_rules_through("none", conf.path());
+    assert_eq!(none.1.health, FirewallHealth::NoFirewall);
+    assert_eq!(none.2, RuleSnapshot::NoFirewall);
+
+    let ufw = blocks_and_rules_through("ufw", Path::new(MISSING_CONF));
+    assert_ne!(ufw.1.health, FirewallHealth::NoFirewall);
+    assert!(matches!(ufw.2, RuleSnapshot::Unavailable(_)));
+}
+
+#[test]
+fn the_none_provider_answers_the_same_on_every_call_and_never_opens_its_input() {
+    let conf = TempFile::new("ENABLED=yes\n");
+    // A directory cannot be followed as a log: a UFW provider would report it unavailable.
+    let dir = std::env::temp_dir();
+    let mut provider = provider_for("none", conf.path(), &dir);
+    let (sender, receiver) = sync_channel(32);
+    for _ in 0..2 {
+        assert_eq!(provider.rules(), RuleSnapshot::NoFirewall);
+        let status = provider.poll(&sender, &AtomicBool::new(false));
+        assert_eq!(status.health, FirewallHealth::NoFirewall);
+        assert_eq!(provider.status().health, FirewallHealth::NoFirewall);
+    }
+    assert!(receiver.try_iter().next().is_none());
+}
+
+#[test]
+fn without_a_firewall_a_wildcard_listener_is_unknown_and_a_loopback_one_is_local() {
+    assert_eq!(
+        exposure(&tcp(80), &RuleSnapshot::NoFirewall, None),
+        Exposure::Unknown("no firewall".to_owned())
+    );
+    assert_eq!(
+        exposure(
+            &listener(Protocol::Tcp, "127.0.0.1", 80),
+            &RuleSnapshot::NoFirewall,
+            None
+        ),
+        Exposure::Local
+    );
+}
+
+/// Every combination of the four facts, in the order the spec gives: firewalld when it is
+/// running; otherwise UFW when it is enabled; otherwise whichever is installed, UFW's if both;
+/// otherwise none. When the bus could not say whether firewalld runs: UFW if it is enabled,
+/// otherwise as if firewalld ran where it is installed, and 045's choice where it is not.
+/// Each row: running, firewalld installed, UFW enabled, UFW installed.
+#[test]
+fn the_choice_over_the_combinations_follows_the_order_the_spec_gives() {
+    use Choice::{Firewalld as Fwd, None as Nothing, Ufw};
+    use Running::{No, Unknown, Yes};
+    let table = [
+        (No, false, false, false, Nothing),
+        (No, false, false, true, Ufw),
+        (No, false, true, false, Ufw),
+        (No, false, true, true, Ufw),
+        (No, true, false, false, Fwd),
+        (No, true, false, true, Ufw),
+        (No, true, true, false, Ufw),
+        (No, true, true, true, Ufw),
+        (Yes, false, false, false, Fwd),
+        (Yes, false, false, true, Fwd),
+        (Yes, false, true, false, Fwd),
+        (Yes, false, true, true, Fwd),
+        (Yes, true, false, false, Fwd),
+        (Yes, true, false, true, Fwd),
+        (Yes, true, true, false, Fwd),
+        (Yes, true, true, true, Fwd),
+        (Unknown, false, false, false, Nothing),
+        (Unknown, false, false, true, Ufw),
+        (Unknown, false, true, false, Ufw),
+        (Unknown, false, true, true, Ufw),
+        (Unknown, true, false, false, Fwd),
+        (Unknown, true, false, true, Fwd),
+        (Unknown, true, true, false, Ufw),
+        (Unknown, true, true, true, Ufw),
+    ];
+    for (firewalld_running, firewalld_installed, ufw_enabled, ufw_installed, expected) in table {
+        let facts = Facts {
+            firewalld_running,
+            firewalld_installed,
+            ufw_enabled,
+            ufw_installed,
+        };
+        assert_eq!(choose(facts), expected, "{facts:?}");
+    }
 }

@@ -15,8 +15,8 @@ use crosswalk::{
         interfaces::{CollectionHealth, InterfaceMeasurement, InterfaceSnapshot, InterfaceStatus},
     },
     firewall::{
-        Exposure, FirewallEndpoint, FirewallEvent, FirewallHealth, FirewallOutcome, FirewallStatus,
-        Policy, Rule, RuleAction, RuleDirection, RuleSnapshot, RuleSource,
+        Exposure, FirewallEndpoint, FirewallEvent, FirewallHealth, FirewallStatus, Policy, Rule,
+        RuleAction, RuleDirection, RuleSnapshot, RuleSource,
     },
     state::{AppState, BlockKind, ByteTotals, StateLimits},
 };
@@ -68,6 +68,7 @@ fn snapshot(name: &str, download: f64, upload: f64) -> InterfaceSnapshot {
             session_received_bytes: 5_000,
             session_transmitted_bytes: 700,
             status: InterfaceStatus::Available,
+            is_up: true,
         }],
         default_route: Some(name.to_owned()),
         gateway: None,
@@ -156,25 +157,18 @@ fn each_sources_health_is_stored_independently_of_the_others() {
 
     state.record_capture_status(CaptureStatus {
         health: CaptureHealth::Degraded("no permission".to_owned()),
-        packets_read: 0,
-        capture_received: 0,
-        capture_dropped: 0,
-        delivery_dropped: 0,
+        dropped: 0,
         origin: CaptureOrigin::Own,
     });
     assert_eq!(none(&state), [false, false, true, false]);
 
     state.record_firewall_status(FirewallStatus {
+        name: "ufw",
         health: FirewallHealth::Unavailable("unreadable".to_owned()),
-        records_read: 0,
-        events_emitted: 0,
-        malformed_records: 0,
-        delivery_dropped: 0,
     });
     state.record_attribution_status(AttributionStatus {
         health: AttributionHealth::Stale("old".to_owned()),
-        incomplete: true,
-        limited: false,
+        only_user: None,
     });
     let mut snapshot = snapshot("eth0", 1.0, 1.0);
     snapshot.health = CollectionHealth::Unavailable("no counters".to_owned());
@@ -202,10 +196,7 @@ fn each_sources_health_is_stored_independently_of_the_others() {
     // A later report from one source leaves the other three as they were.
     state.record_capture_status(CaptureStatus {
         health: CaptureHealth::Available,
-        packets_read: 1,
-        capture_received: 1,
-        capture_dropped: 0,
-        delivery_dropped: 0,
+        dropped: 0,
         origin: CaptureOrigin::Own,
     });
     let health = state.source_health();
@@ -558,8 +549,6 @@ fn block(source: &str, port: u16, protocol: Protocol, direction: Direction) -> F
             ip: Some("192.0.2.10".parse().unwrap()),
             port: Some(port),
         },
-        process: None,
-        outcome: FirewallOutcome::Blocked,
     }
 }
 
@@ -608,7 +597,6 @@ fn a_repeated_block_raises_the_count_and_keeps_its_position() {
     let rows = state.blocked(Direction::Inbound);
     assert_eq!(rows[1].count, 2);
     assert_eq!(rows[1].first_seen, secs(1));
-    assert_eq!(rows[1].last_seen, secs(5));
     assert_eq!(rows[0].count, 1);
 }
 
@@ -850,7 +838,6 @@ fn a_second_attempt_from_another_source_port_raises_the_count_and_keeps_the_plac
     assert_eq!(rows[0].source, Some("10.0.1.13".parse().unwrap()));
     assert_eq!(rows[1].source, Some("10.0.1.12".parse().unwrap()));
     assert_eq!(rows[1].count, 2);
-    assert_eq!(rows[1].last_seen, secs(3));
 }
 
 #[test]
@@ -1022,17 +1009,31 @@ fn before_any_neighbour_snapshot_the_state_says_so() {
 }
 
 #[test]
-fn a_limited_attribution_status_is_kept_until_an_unlimited_one_replaces_it() {
-    let status = |limited| AttributionStatus {
+fn the_user_an_attribution_status_names_is_kept_until_a_status_without_one_replaces_it() {
+    let status = |only_user: Option<&str>| AttributionStatus {
         health: AttributionHealth::Available,
-        incomplete: false,
-        limited,
+        only_user: only_user.map(str::to_owned),
     };
     let mut state = AppState::new(StateLimits::default()).unwrap();
-    state.record_attribution_status(status(true));
-    assert!(state.source_health().attribution.as_ref().unwrap().limited);
-    state.record_attribution_status(status(false));
-    assert!(!state.source_health().attribution.as_ref().unwrap().limited);
+    state.record_attribution_status(status(Some("alice")));
+    let kept = state
+        .source_health()
+        .attribution
+        .as_ref()
+        .unwrap()
+        .only_user
+        .clone();
+    assert_eq!(kept.as_deref(), Some("alice"));
+    state.record_attribution_status(status(None));
+    assert_eq!(
+        state
+            .source_health()
+            .attribution
+            .as_ref()
+            .unwrap()
+            .only_user,
+        None
+    );
 }
 
 #[test]
@@ -2144,12 +2145,251 @@ fn the_capture_status_keeps_which_source_it_came_from() {
     let mut state = AppState::new(StateLimits::default()).unwrap();
     state.record_capture_status(CaptureStatus {
         health: CaptureHealth::Available,
-        packets_read: 1,
-        capture_received: 0,
-        capture_dropped: 0,
-        delivery_dropped: 0,
+        dropped: 0,
         origin: CaptureOrigin::Dumpcap,
     });
     let status = state.source_health().capture.clone().unwrap();
     assert_eq!(status.origin, CaptureOrigin::Dumpcap);
+}
+
+#[test]
+fn with_no_firewall_no_switched_event_and_no_exposure_event_is_recorded() {
+    let mut state = events_state();
+    state.record_listeners(
+        vec![owned_listener(
+            Protocol::Tcp,
+            "0.0.0.0",
+            22,
+            "/usr/bin/sshd",
+        )],
+        EPHEMERAL,
+    );
+    state.record_rules(RuleSnapshot::NoFirewall);
+    state.record_rules(RuleSnapshot::NoFirewall);
+    state.record_listeners(
+        vec![
+            owned_listener(Protocol::Tcp, "0.0.0.0", 22, "/usr/bin/sshd"),
+            owned_listener(Protocol::Tcp, "0.0.0.0", 8080, "/usr/bin/app"),
+        ],
+        EPHEMERAL,
+    );
+    state.record_listeners(
+        vec![owned_listener(
+            Protocol::Tcp,
+            "127.0.0.1",
+            8080,
+            "/usr/bin/app",
+        )],
+        EPHEMERAL,
+    );
+    state.record_rules(RuleSnapshot::NoFirewall);
+    let texts = event_texts(&state);
+    assert!(
+        texts
+            .iter()
+            .all(|text| !text.contains("UFW") && !text.contains(" exposure ")),
+        "{texts:?}"
+    );
+    assert!(
+        texts.contains(&"tcp 0.0.0.0:8080 app started listening, unknown".to_owned()),
+        "{texts:?}"
+    );
+    assert!(
+        levels(&state)
+            .iter()
+            .all(|l| *l == crosswalk::events::EventLevel::Normal)
+    );
+}
+
+#[test]
+fn recent_drops_are_the_sum_of_those_reported_within_ten_seconds_of_now() {
+    let mut state = AppState::new(StateLimits::default()).unwrap();
+    let report = |state: &mut AppState, at: u64, dropped: u64| {
+        state.advance_time(Duration::from_secs(at));
+        state.record_capture_status(CaptureStatus {
+            health: CaptureHealth::Available,
+            dropped,
+            origin: CaptureOrigin::Own,
+        });
+    };
+    report(&mut state, 10, 3);
+    report(&mut state, 15, 4);
+    assert_eq!(state.recent_drops(), 7);
+
+    state.advance_time(Duration::from_secs(19));
+    assert_eq!(state.recent_drops(), 7);
+    state.advance_time(Duration::from_secs(20));
+    assert_eq!(state.recent_drops(), 4);
+    state.advance_time(Duration::from_secs(25));
+    assert_eq!(state.recent_drops(), 0);
+}
+
+#[test]
+fn listening_ports_follow_the_zones_of_the_interfaces_the_state_holds() {
+    use crosswalk::{
+        collect::interfaces::InterfaceAddress,
+        firewall::{
+            Allowed, Zone, Zones,
+            firewalld_reply::{PortRule, Target},
+        },
+    };
+    let mut state = AppState::new(StateLimits::default()).unwrap();
+    let mut interfaces = snapshot("eth0", 1.0, 1.0);
+    interfaces.interfaces[0].addresses = vec![InterfaceAddress {
+        ip: "192.168.1.5".parse().unwrap(),
+        prefix: 24,
+    }];
+    state.record_interfaces(interfaces);
+    state.record_listeners(
+        vec![
+            listener(Protocol::Tcp, "0.0.0.0", 22),
+            listener(Protocol::Tcp, "192.168.1.5", 23),
+            listener(Protocol::Tcp, "10.9.9.9", 24),
+        ],
+        EPHEMERAL,
+    );
+    let ssh = |port| {
+        Allowed::Port(PortRule {
+            ports: port..=port,
+            protocol: "tcp".to_owned(),
+        })
+    };
+    state.record_rules(RuleSnapshot::Zones(Zones {
+        default_zone: "public".to_owned(),
+        zones: vec![Zone {
+            name: "public".to_owned(),
+            interfaces: vec!["eth0".to_owned()],
+            sources: vec![],
+            target: Target::Default,
+            allowed: vec![ssh(22), ssh(23), ssh(24)],
+            rich_rules: vec![],
+        }],
+    }));
+    let seen: Vec<_> = state
+        .listening_ports()
+        .iter()
+        .map(|p| (p.listener.port, p.exposure.clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (22, Exposure::Open(None)),
+            (23, Exposure::Open(None)),
+            // No interface holds 10.9.9.9, so it is judged as listening on every interface.
+            (24, Exposure::Open(None)),
+        ]
+    );
+}
+
+fn port_of_zones(state: &mut AppState) -> Exposure {
+    use crosswalk::firewall::{Zone, Zones, firewalld_reply::Target};
+    state.record_listeners(vec![listener(Protocol::Tcp, "0.0.0.0", 22)], EPHEMERAL);
+    state.record_rules(RuleSnapshot::Zones(Zones {
+        default_zone: "public".to_owned(),
+        zones: vec![Zone {
+            name: "public".to_owned(),
+            interfaces: vec!["eth0".to_owned()],
+            sources: Vec::new(),
+            target: Target::Default,
+            allowed: Vec::new(),
+            rich_rules: Vec::new(),
+        }],
+    }));
+    state.listening_ports().remove(0).exposure
+}
+
+#[test]
+fn zones_without_an_interface_reading_leave_exposure_unknown_not_blocked() {
+    let mut state = AppState::new(StateLimits::default()).unwrap();
+    assert!(matches!(port_of_zones(&mut state), Exposure::Unknown(_)));
+}
+
+#[test]
+fn zones_with_an_interface_reading_that_failed_leave_exposure_unknown() {
+    for health in [
+        CollectionHealth::Unavailable("gone".to_owned()),
+        CollectionHealth::Stale("gone".to_owned()),
+    ] {
+        let mut state = AppState::new(StateLimits::default()).unwrap();
+        let mut failed = snapshot("eth0", 0.0, 0.0);
+        failed.health = health;
+        state.record_interfaces(failed);
+        assert!(matches!(port_of_zones(&mut state), Exposure::Unknown(_)));
+    }
+}
+
+#[test]
+fn zones_with_a_readable_interface_reading_judge_the_port() {
+    let mut state = AppState::new(StateLimits::default()).unwrap();
+    let mut reading = snapshot("eth0", 0.0, 0.0);
+    reading.interfaces[0].addresses = vec![crosswalk::collect::interfaces::InterfaceAddress {
+        ip: "192.168.1.5".parse().unwrap(),
+        prefix: 24,
+    }];
+    state.record_interfaces(reading);
+    assert_eq!(port_of_zones(&mut state), Exposure::Blocked(None));
+}
+
+/// `eth0` is in a zone that lets port 22 in and `eth1`, with an address, is in one that does not.
+fn wildcard_port_with_a_second_interface(second_is_up: bool) -> Exposure {
+    use crosswalk::{
+        collect::interfaces::InterfaceAddress,
+        firewall::{
+            Allowed, Zone, Zones,
+            firewalld_reply::{PortRule, Target},
+        },
+    };
+    let mut state = AppState::new(StateLimits::default()).unwrap();
+    let mut reading = snapshot("eth0", 0.0, 0.0);
+    let mut second = reading.interfaces[0].clone();
+    second.name = "eth1".to_owned();
+    second.is_up = second_is_up;
+    for (interface, ip) in reading
+        .interfaces
+        .iter_mut()
+        .chain([&mut second])
+        .zip(["10.0.0.5", "10.0.1.5"])
+    {
+        interface.addresses = vec![InterfaceAddress {
+            ip: ip.parse().unwrap(),
+            prefix: 24,
+        }];
+    }
+    reading.interfaces.push(second);
+    state.record_interfaces(reading);
+    state.record_listeners(vec![listener(Protocol::Tcp, "0.0.0.0", 22)], EPHEMERAL);
+    let zone = |name: &str, allowed| Zone {
+        name: name.to_owned(),
+        interfaces: vec![format!("eth{}", usize::from(name == "work"))],
+        sources: Vec::new(),
+        target: Target::Default,
+        allowed,
+        rich_rules: Vec::new(),
+    };
+    let ssh = Allowed::Port(PortRule {
+        ports: 22..=22,
+        protocol: "tcp".to_owned(),
+    });
+    state.record_rules(RuleSnapshot::Zones(Zones {
+        default_zone: "public".to_owned(),
+        zones: vec![zone("public", vec![ssh]), zone("work", Vec::new())],
+    }));
+    state.listening_ports().remove(0).exposure
+}
+
+#[test]
+fn an_interface_that_is_administratively_down_is_left_out_of_a_wildcard_ports_judgement() {
+    assert_eq!(
+        wildcard_port_with_a_second_interface(false),
+        Exposure::Open(None)
+    );
+}
+
+#[test]
+fn an_interface_that_is_up_without_carrier_keeps_its_zone_in_the_judgement() {
+    // Carrier is not read at all: an unplugged interface that is up is `is_up`.
+    assert_eq!(
+        wildcard_port_with_a_second_interface(true),
+        Exposure::Limited(None)
+    );
 }

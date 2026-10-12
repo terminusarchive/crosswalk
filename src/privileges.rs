@@ -5,13 +5,11 @@ use std::fmt;
 use std::io;
 
 const CAP_NET_RAW: u32 = 13;
-const CAP_SYS_PTRACE: u32 = 19;
 
-/// The capabilities Crosswalk cares about, from the effective set.
+/// The capability Crosswalk cares about, from the effective set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capabilities {
     pub net_raw: bool,
-    pub sys_ptrace: bool,
 }
 
 /// Reads the effective set from the text of `/proc/self/status`.
@@ -23,7 +21,6 @@ pub fn capabilities_from_status(status: &str) -> Option<Capabilities> {
     let mask = u64::from_str_radix(value.trim(), 16).ok()?;
     Some(Capabilities {
         net_raw: mask & (1 << CAP_NET_RAW) != 0,
-        sys_ptrace: mask & (1 << CAP_SYS_PTRACE) != 0,
     })
 }
 
@@ -32,7 +29,7 @@ pub fn missing_net_raw_message(binary: &str) -> String {
     format!(
         "crosswalk cannot capture packets: it lacks the cap_net_raw capability.\n\
          Grant it to the binary with:\n\
-         \n    sudo setcap cap_net_raw,cap_sys_ptrace+ep {}\n\n\
+         \n    sudo setcap cap_net_raw+ep {}\n\n\
          Repeat this after each build or install; the capabilities do not survive a new file.\n\
          Or run Crosswalk with sudo instead.",
         shell_quote(binary)
@@ -53,7 +50,6 @@ fn shell_quote(text: &str) -> String {
 
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const NET_RAW_BIT: u64 = 1 << CAP_NET_RAW;
-const SYS_PTRACE_BIT: u64 = 1 << CAP_SYS_PTRACE;
 
 /// The sets of one thread, one bit per capability.
 /// `effective` is what is in force now; `permitted` is what the thread could switch on.
@@ -97,7 +93,7 @@ struct CapData {
     inheritable: u32,
 }
 
-fn is_root() -> bool {
+pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
@@ -157,30 +153,17 @@ fn change(
 
 /// Takes every capability out of effect on this thread; they stay available.
 pub fn take_everything_out_of_effect() -> Result<(), PrivilegeError> {
-    change("cap_net_raw and cap_sys_ptrace", |sets| {
-        ThreadCapabilities {
-            effective: 0,
-            ..sets
-        }
+    change("its capabilities", |sets| ThreadCapabilities {
+        effective: 0,
+        ..sets
     })
 }
 
 /// Gives up every capability on this thread for good.
 pub fn give_up_everything() -> Result<(), PrivilegeError> {
-    change("cap_net_raw and cap_sys_ptrace", |sets| {
-        ThreadCapabilities {
-            effective: 0,
-            permitted: 0,
-            ..sets
-        }
-    })
-}
-
-/// Gives up everything on this thread except that `cap_sys_ptrace` stays available.
-pub fn keep_only_sys_ptrace_available() -> Result<(), PrivilegeError> {
-    change("cap_net_raw", |sets| ThreadCapabilities {
+    change("its capabilities", |sets| ThreadCapabilities {
         effective: 0,
-        permitted: sets.permitted & SYS_PTRACE_BIT,
+        permitted: 0,
         ..sets
     })
 }
@@ -207,44 +190,4 @@ fn read_own_sets() -> Result<ThreadCapabilities, PrivilegeError> {
         capability: None,
         source,
     })
-}
-
-fn set_sys_ptrace_in_effect(in_effect: bool) -> Result<(), PrivilegeError> {
-    change("cap_sys_ptrace", |sets| ThreadCapabilities {
-        effective: if in_effect {
-            sets.effective | SYS_PTRACE_BIT
-        } else {
-            sets.effective & !SYS_PTRACE_BIT
-        },
-        ..sets
-    })
-}
-
-/// Takes `cap_sys_ptrace` out of effect when dropped, including while unwinding.
-struct SysPtraceInEffect;
-
-impl SysPtraceInEffect {
-    fn end(self) -> Result<(), PrivilegeError> {
-        std::mem::forget(self);
-        set_sys_ptrace_in_effect(false)
-    }
-}
-
-impl Drop for SysPtraceInEffect {
-    fn drop(&mut self) {
-        let _ = set_sys_ptrace_in_effect(false);
-    }
-}
-
-/// Runs `work` with `cap_sys_ptrace` in effect on this thread, and out of effect after,
-/// also if `work` panics. A thread that does not have it available just runs `work`.
-pub fn with_sys_ptrace<T>(work: impl FnOnce() -> T) -> Result<T, PrivilegeError> {
-    if read_own_sets()?.permitted & SYS_PTRACE_BIT == 0 {
-        return Ok(work());
-    }
-    set_sys_ptrace_in_effect(true)?;
-    let guard = SysPtraceInEffect;
-    let value = work();
-    guard.end()?;
-    Ok(value)
 }

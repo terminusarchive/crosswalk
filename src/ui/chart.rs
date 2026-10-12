@@ -1,6 +1,10 @@
 //! The mirrored bandwidth chart: outbound rises from a centre line, inbound hangs below it.
 
-use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Style},
+};
 
 use super::{
     Theme,
@@ -66,39 +70,31 @@ impl<'a> Chart<'a> {
         for (i, sample) in visible.iter().enumerate() {
             let x = plot_x + (first + i) as u16;
             let outbound = eighths(sample.upload, up_peak, up_rows);
+            let outbound_tone = self.tone(self.theme.outbound, sample.upload, up_peak);
             for row in 0..up_rows {
                 let fill = cell_fill(outbound, row);
                 if fill > 0 {
                     buffer[(x, centre - 1 - row)]
                         .set_symbol(BLOCKS[fill - 1])
-                        .set_style(
-                            Style::new()
-                                .fg(self.theme.outbound)
-                                .bg(self.theme.background),
-                        );
+                        .set_style(Style::new().fg(outbound_tone).bg(self.theme.background));
                 }
             }
             let inbound = eighths(sample.download, down_peak, down_rows);
+            let inbound_tone = self.tone(self.theme.inbound, sample.download, down_peak);
             for row in 0..down_rows {
                 let fill = cell_fill(inbound, row);
                 let cell = &mut buffer[(x, centre + 1 + row)];
                 match fill {
                     0 => {}
                     8 => {
-                        cell.set_symbol("█").set_style(
-                            Style::new()
-                                .fg(self.theme.inbound)
-                                .bg(self.theme.background),
-                        );
+                        cell.set_symbol("█")
+                            .set_style(Style::new().fg(inbound_tone).bg(self.theme.background));
                     }
                     // Filled from the top by `fill` eighths: the lower block of the
                     // complement, drawn over an inbound-coloured background.
                     _ => {
-                        cell.set_symbol(BLOCKS[7 - fill]).set_style(
-                            Style::new()
-                                .fg(self.theme.background)
-                                .bg(self.theme.inbound),
-                        );
+                        cell.set_symbol(BLOCKS[7 - fill])
+                            .set_style(Style::new().fg(self.theme.background).bg(inbound_tone));
                     }
                 }
             }
@@ -109,6 +105,14 @@ impl<'a> Chart<'a> {
             let x = area.x + area.width - BAR_WIDTH;
             self.totals(buffer, x, area, centre);
         }
+    }
+
+    /// The theme's `colour` shaded for a bar of `value` on a side whose tallest is `peak`.
+    fn tone(&self, colour: Color, value: f64, peak: f64) -> Color {
+        if peak <= 0.0 {
+            return colour;
+        }
+        shade(colour, self.theme.background, value / peak)
     }
 
     /// The right gutter: bytes sent on the first row, the split bar on the
@@ -183,6 +187,25 @@ impl<'a> Chart<'a> {
             line(centre + 2, "peak", down_peak, self.theme.muted);
         }
     }
+}
+
+/// How much of its colour the smallest bar keeps: enough to stay clear of the
+/// background in every built-in theme.
+const FLOOR: f64 = 0.35;
+
+/// `colour` mixed toward `background`: all of it for a `share` of 1 (a bar at
+/// the peak), `FLOOR` of it for a share of 0. A colour the mix cannot be
+/// computed for, one that is not RGB, comes back unchanged.
+pub fn shade(colour: Color, background: Color, share: f64) -> Color {
+    let (Color::Rgb(r, g, b), Color::Rgb(back_r, back_g, back_b)) = (colour, background) else {
+        return colour;
+    };
+    let kept = FLOOR + (1.0 - FLOOR) * share.clamp(0.0, 1.0);
+    let mix = |channel: u8, back: u8| {
+        let (channel, back) = (f64::from(channel), f64::from(back));
+        (back + (channel - back) * kept).round() as u8
+    };
+    Color::Rgb(mix(r, back_r), mix(g, back_g), mix(b, back_b))
 }
 
 /// Bar height in eighths of a cell for a half `rows` tall; any non-zero value gets at least one.

@@ -1,7 +1,11 @@
 use std::{
     collections::{HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{atomic::AtomicBool, mpsc::sync_channel},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::sync_channel,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -375,7 +379,6 @@ fn capture_polling_reports_link_errors_capture_loss_queue_loss_and_cancellation(
             Err("capture read failed".to_owned()),
         ]),
         statistics: Ok(CaptureStatistics {
-            received: 10,
             dropped: 3,
             interface_dropped: 2,
         }),
@@ -407,9 +410,7 @@ fn capture_polling_reports_link_errors_capture_loss_queue_loss_and_cancellation(
         status.health,
         CaptureHealth::Degraded("capture read failed".to_owned())
     );
-    assert_eq!(status.capture_dropped, 5);
-    assert_eq!(status.delivery_dropped, 1);
-    assert_eq!(status.packets_read, 1);
+    assert_eq!(status.dropped, 6);
     drop(receiver);
 
     let idle = ScriptedSource {
@@ -421,7 +422,6 @@ fn capture_polling_reports_link_errors_capture_loss_queue_loss_and_cancellation(
     let (sender, _receiver) = sync_channel(1);
     let status = worker.poll(&sender, &AtomicBool::new(true));
     assert_eq!(status.health, CaptureHealth::Cancelled);
-    assert_eq!(status.packets_read, 0);
 }
 
 #[test]
@@ -539,4 +539,74 @@ fn a_removed_address_no_longer_makes_packets_this_machines() {
     normalizer.set_local_addresses(locals([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]));
 
     assert_eq!(normalizer.normalize(&between_others), None);
+}
+
+/// A capture whose kernel drop count the test sets between polls.
+struct KernelDrops(Arc<AtomicU32>);
+
+impl CaptureSource for KernelDrops {
+    fn link_type(&self) -> i32 {
+        SLL2_LINKTYPE
+    }
+    fn next_packet(&mut self) -> Result<PacketRead, String> {
+        Ok(PacketRead::Idle)
+    }
+    fn statistics(&mut self) -> Result<CaptureStatistics, String> {
+        Ok(CaptureStatistics {
+            dropped: self.0.load(Ordering::Relaxed),
+            interface_dropped: 0,
+        })
+    }
+}
+
+fn dropped_after_each_count(counts: &[u32]) -> Vec<u64> {
+    let kernel_count = Arc::new(AtomicU32::new(0));
+    let mut worker =
+        CaptureWorker::new(KernelDrops(kernel_count.clone()), HashSet::new(), 8).unwrap();
+    let (sender, _receiver) = sync_channel(1);
+    counts
+        .iter()
+        .map(|count| {
+            kernel_count.store(*count, Ordering::Relaxed);
+            worker.poll(&sender, &AtomicBool::new(false)).dropped
+        })
+        .collect()
+}
+
+#[test]
+fn the_kernel_count_that_only_grows_is_reported_as_drops_since_the_last_status() {
+    assert_eq!(dropped_after_each_count(&[5, 8, 8]), [5, 3, 0]);
+}
+
+#[test]
+fn a_kernel_count_that_goes_down_is_a_capture_opened_again_and_not_a_huge_number() {
+    assert_eq!(dropped_after_each_count(&[100, 4]), [100, 4]);
+}
+
+#[test]
+fn drops_on_the_full_queue_are_reported_once() {
+    let local = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    let packet = sll2(
+        7,
+        PACKET_OUTGOING,
+        0x0800,
+        &ipv4([10, 0, 0, 2], [198, 51, 100, 20], 17, 0, &ports(1, 2), 28),
+    );
+    let source = ScriptedSource {
+        link_type: SLL2_LINKTYPE,
+        reads: VecDeque::from([packet.clone(), packet.clone(), packet].map(|data| {
+            Ok(PacketRead::Packet {
+                data,
+                captured_at: None,
+            })
+        })),
+        statistics: Ok(CaptureStatistics::default()),
+    };
+    let mut worker = CaptureWorker::new(source, locals([local]), 2).unwrap();
+    let (sender, _receiver) = sync_channel(1);
+
+    let first = worker.poll(&sender, &AtomicBool::new(false));
+    let second = worker.poll(&sender, &AtomicBool::new(false));
+
+    assert_eq!((first.dropped, second.dropped), (1, 1));
 }

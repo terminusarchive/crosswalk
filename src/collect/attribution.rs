@@ -31,17 +31,15 @@ pub enum AttributionHealth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttributionStatus {
     pub health: AttributionHealth,
-    pub incomplete: bool,
-    /// Set by the runtime when the process cannot read other users' processes
-    /// (no `cap_sys_ptrace`), so their programs cannot be named.
-    pub limited: bool,
+    /// Set by the runtime to the name of the user running Crosswalk when it is not
+    /// root, because it can then name only that user's programs.
+    pub only_user: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttributionResult {
     pub owner: Option<ProcessIdentity>,
     pub health: AttributionHealth,
-    pub incomplete: bool,
 }
 
 /// A TCP socket in the listening state or a UDP socket bound without a peer.
@@ -125,7 +123,6 @@ impl LinuxProcfsSource {
         let started = Instant::now();
         let network_namespace = namespace_id(&self.root.join("self/ns/net"))?;
         let mut sockets = Vec::new();
-        let mut incomplete = false;
         for (name, family, protocol) in [
             ("tcp", AddressFamily::Ipv4, Protocol::Tcp),
             ("tcp6", AddressFamily::Ipv6, Protocol::Tcp),
@@ -134,7 +131,6 @@ impl LinuxProcfsSource {
         ] {
             for socket in read_socket_table(&self.root.join("net").join(name), family, protocol)? {
                 if sockets.len() == capacity {
-                    incomplete = true;
                     break;
                 }
                 sockets.push(socket);
@@ -184,7 +180,6 @@ impl LinuxProcfsSource {
                     continue;
                 }
                 if owner_count == capacity {
-                    incomplete = true;
                     break;
                 }
                 owners.entry(inode).or_default().push(process.clone());
@@ -196,7 +191,6 @@ impl LinuxProcfsSource {
         Ok(Snapshot {
             sockets,
             owners,
-            incomplete,
             stats,
         })
     }
@@ -246,15 +240,13 @@ impl AttributionCollector {
     pub fn refresh(&mut self, now: Duration) -> AttributionStatus {
         match self.source.read_snapshot(self.capacity) {
             Ok(snapshot) => {
-                let incomplete = snapshot.incomplete;
                 self.remember(&snapshot, now);
                 self.snapshot = Some(snapshot);
                 self.sampled_at = Some(now);
                 self.health = AttributionHealth::Available;
                 AttributionStatus {
                     health: self.health.clone(),
-                    incomplete,
-                    limited: false,
+                    only_user: None,
                 }
             }
             Err(error) => {
@@ -265,11 +257,7 @@ impl AttributionCollector {
                 };
                 AttributionStatus {
                     health: self.health.clone(),
-                    incomplete: self
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.incomplete),
-                    limited: false,
+                    only_user: None,
                 }
             }
         }
@@ -311,10 +299,6 @@ impl AttributionCollector {
     }
 
     pub fn attribute(&self, event: &TrafficEvent, now: Duration) -> AttributionResult {
-        let incomplete = self
-            .snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.incomplete);
         let health = self.current_health(now);
         let owner = if health == AttributionHealth::Available {
             self.snapshot
@@ -324,11 +308,7 @@ impl AttributionCollector {
         } else {
             None
         };
-        AttributionResult {
-            owner,
-            health,
-            incomplete,
-        }
+        AttributionResult { owner, health }
     }
 
     fn remember(&mut self, snapshot: &Snapshot, now: Duration) {
@@ -392,7 +372,6 @@ impl AttributionCollector {
 struct Snapshot {
     sockets: Vec<SocketRecord>,
     owners: HashMap<u64, Vec<ProcessIdentity>>,
-    incomplete: bool,
     stats: SnapshotStats,
 }
 

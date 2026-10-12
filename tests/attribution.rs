@@ -132,7 +132,6 @@ fn attributes_ipv4_and_ipv6_tcp_udp_without_collapsing_executable_identity() {
     .unwrap();
     let status = collector.refresh(Duration::from_secs(1));
     assert_eq!(status.health, AttributionHealth::Available);
-    assert!(!status.incomplete);
 
     let ipv4_tcp = collector
         .attribute(
@@ -317,15 +316,6 @@ fn wildcard_matching_requires_one_best_owner_and_snapshot_storage_is_bounded() {
             .pid,
         302
     );
-
-    let mut bounded = AttributionCollector::new(
-        LinuxProcfsSource::new(fixture.path()),
-        Duration::from_secs(2),
-        1,
-    )
-    .unwrap();
-    let status = bounded.refresh(Duration::ZERO);
-    assert!(status.incomplete);
 }
 
 #[test]

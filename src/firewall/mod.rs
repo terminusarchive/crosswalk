@@ -2,28 +2,36 @@ use std::{
     io,
     net::IpAddr,
     ops::RangeInclusive,
-    sync::{atomic::AtomicBool, mpsc::SyncSender},
+    path::Path,
+    sync::{Arc, atomic::AtomicBool, mpsc::SyncSender},
 };
+
+use firewalld_reply::ActiveZone;
 
 use crate::{
     collect::{
-        attribution::{Listener, ProcessIdentity},
+        attribution::Listener,
         capture::{Direction, Protocol},
     },
+    command::{SYSTEM_DIRECTORIES, find_program_in},
     config::{Config, FirewallProvider as ConfiguredProvider, UfwSource},
 };
 
+mod firewalld;
+pub mod firewalld_reply;
+mod none;
 mod ufw;
+mod zones;
 
+pub use firewalld::{BlockSource, FirewalldProvider};
 pub use ufw::{
-    FileInput, FirewallInput, InputRead, JournalInput, JournalProcess, LineReader, UfwProvider,
-    checked_ufw_health, create_with_conf,
+    BlockMarker, BlockReader, FileInput, FirewallInput, InputRead, JournalInput, JournalProcess,
+    LineReader, UfwProvider, checked_ufw_health, create_with_conf,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FirewallOutcome {
-    Blocked,
-}
+pub use zones::{
+    Allowed, InterfaceAddresses, NO_DEFAULT_ZONE, NO_INTERFACE_READING, NO_USABLE_INTERFACE, Zone,
+    Zones,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FirewallEndpoint {
@@ -39,8 +47,6 @@ pub struct FirewallEvent {
     pub protocol: Option<Protocol>,
     pub source: FirewallEndpoint,
     pub destination: FirewallEndpoint,
-    pub process: Option<ProcessIdentity>,
-    pub outcome: FirewallOutcome,
 }
 
 impl FirewallEvent {
@@ -52,8 +58,6 @@ impl FirewallEvent {
             protocol: None,
             source: FirewallEndpoint::default(),
             destination: FirewallEndpoint::default(),
-            process: None,
-            outcome: FirewallOutcome::Blocked,
         }
     }
 }
@@ -66,15 +70,19 @@ pub enum FirewallHealth {
     Unavailable(String),
     Degraded(String),
     Cancelled,
+    /// No supported firewall is in use; nothing is read.
+    NoFirewall,
+    /// firewalld is not logging denied packets, which is how it is installed: not a fault.
+    NotLogging,
+    /// firewalld would not say whether it logs denied packets to this user: blocks show if it does.
+    DependsOnLogging,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FirewallStatus {
+    /// The firewall in use, as the header names it: `ufw` or `none`.
+    pub name: &'static str,
     pub health: FirewallHealth,
-    pub records_read: u64,
-    pub events_emitted: u64,
-    pub malformed_records: u64,
-    pub delivery_dropped: u64,
 }
 
 pub trait FirewallProvider: Send {
@@ -180,6 +188,14 @@ pub struct Rule {
 pub enum RuleSnapshot {
     Unavailable(String),
     Inactive,
+    /// No supported firewall is in use.
+    NoFirewall,
+    /// firewalld's active zones, with each service's ports resolved.
+    Zones(Zones),
+    /// firewalld is running but shows this user only its active zones and what they apply to.
+    ZonesOnly(Vec<ActiveZone>),
+    /// firewalld is not running.
+    FirewalldOff,
     Active {
         default_incoming: Policy,
         default_outgoing: Policy,
@@ -188,6 +204,11 @@ pub enum RuleSnapshot {
 }
 
 /// Each variant that was decided by a rule carries that rule's text, when there is one.
+/// Why the exposure of a port is unknown when firewalld is not running, and when it shows this
+/// user only its zones; the dashboard matches these strings.
+pub const FIREWALLD_OFF: &str = "fwd off";
+pub const NOT_READABLE: &str = "not readable";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Exposure {
     Open(Option<String>),
@@ -228,13 +249,21 @@ impl Rule {
     }
 }
 
-pub fn exposure(listener: &Listener, snapshot: &RuleSnapshot) -> Exposure {
-    if listener.address.is_loopback() {
+pub fn exposure(
+    listener: &Listener,
+    snapshot: &RuleSnapshot,
+    interfaces: Option<&[InterfaceAddresses]>,
+) -> Exposure {
+    if listener.address.to_canonical().is_loopback() {
         return Exposure::Local;
     }
     let (default_incoming, rules) = match snapshot {
         RuleSnapshot::Unavailable(reason) => return Exposure::Unknown(reason.clone()),
         RuleSnapshot::Inactive => return Exposure::Unknown("ufw off".to_owned()),
+        RuleSnapshot::NoFirewall => return Exposure::Unknown("no firewall".to_owned()),
+        RuleSnapshot::FirewalldOff => return Exposure::Unknown(FIREWALLD_OFF.to_owned()),
+        RuleSnapshot::ZonesOnly(_) => return Exposure::Unknown(NOT_READABLE.to_owned()),
+        RuleSnapshot::Zones(zones) => return zones.exposure(listener, interfaces),
         RuleSnapshot::Active {
             default_incoming,
             rules,
@@ -269,9 +298,104 @@ pub fn exposure(listener: &Listener, snapshot: &RuleSnapshot) -> Exposure {
     }
 }
 
-pub fn create_provider(config: &Config) -> Box<dyn FirewallProvider> {
-    match config.firewall_provider {
-        ConfiguredProvider::Ufw => ufw::create(&config.ufw_source),
+/// Whether firewalld is running, as far as the bus could say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Running {
+    Yes,
+    No,
+    /// The question failed or timed out.
+    Unknown,
+}
+
+/// What `auto` can see of the machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Facts {
+    pub firewalld_running: Running,
+    pub firewalld_installed: bool,
+    pub ufw_enabled: bool,
+    pub ufw_installed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choice {
+    Firewalld,
+    Ufw,
+    None,
+}
+
+/// The firewall `auto` reads: firewalld when it is running; otherwise UFW when it is enabled;
+/// otherwise whichever is installed, UFW's if both; otherwise none. When the bus could not say
+/// whether firewalld runs, an enabled UFW is chosen; otherwise firewalld where it is installed,
+/// so that its failure shows, and else as if it were not running.
+pub fn choose(facts: Facts) -> Choice {
+    let installed = facts.firewalld_installed;
+    match facts.firewalld_running {
+        Running::Yes => return Choice::Firewalld,
+        Running::Unknown if installed && !facts.ufw_enabled => return Choice::Firewalld,
+        Running::Unknown | Running::No => {}
+    }
+    if facts.ufw_enabled || facts.ufw_installed {
+        return Choice::Ufw;
+    }
+    if installed {
+        return Choice::Firewalld;
+    }
+    Choice::None
+}
+
+/// Whether a firewalld program is in one of `directories`. The directory firewalld keeps its
+/// files in is not looked at: it can exist without firewalld.
+fn firewalld_installed(directories: &[&Path]) -> bool {
+    ["firewalld", "firewall-cmd"]
+        .iter()
+        .any(|name| find_program_in(name, directories).is_some())
+}
+
+/// Reads the four facts. A `ufw.conf` that exists and cannot be read is UFW installed, and not
+/// enabled: UFW's provider reports the unreadable file itself.
+fn read_facts(ufw_conf: &Path, firewalld: &FirewalldProvider, directories: &[&Path]) -> Facts {
+    let running = match firewalld.is_running() {
+        Ok(true) => Running::Yes,
+        Ok(false) => Running::No,
+        Err(_) => Running::Unknown,
+    };
+    Facts {
+        firewalld_running: running,
+        firewalld_installed: firewalld_installed(directories),
+        ufw_enabled: ufw::enabled(ufw_conf).unwrap_or(false),
+        ufw_installed: ufw_conf.exists(),
+    }
+}
+
+/// The provider for the machine, chosen once at startup. A quit sets `cancelled` and ends any
+/// call to firewalld at once.
+pub fn create_provider(config: &Config, cancelled: Arc<AtomicBool>) -> Box<dyn FirewallProvider> {
+    create_provider_with(
+        config,
+        Path::new(ufw::UFW_CONF),
+        FirewalldProvider::new(cancelled),
+        &SYSTEM_DIRECTORIES.map(Path::new),
+    )
+}
+
+/// Builds the provider the configuration asks for, reading UFW's settings from `ufw_conf`,
+/// firewalld through `firewalld`, and looking for firewalld's programs in `directories`.
+pub fn create_provider_with(
+    config: &Config,
+    ufw_conf: &Path,
+    firewalld: FirewalldProvider,
+    directories: &[&Path],
+) -> Box<dyn FirewallProvider> {
+    let choice = match config.firewall_provider {
+        ConfiguredProvider::Ufw => Choice::Ufw,
+        ConfiguredProvider::Firewalld => Choice::Firewalld,
+        ConfiguredProvider::None => Choice::None,
+        ConfiguredProvider::Auto => choose(read_facts(ufw_conf, &firewalld, directories)),
+    };
+    match choice {
+        Choice::Ufw => ufw::create_with_conf(&config.ufw_source, ufw_conf),
+        Choice::Firewalld => Box::new(firewalld),
+        Choice::None => Box::new(none::NoFirewallProvider),
     }
 }
 
@@ -281,9 +405,7 @@ fn unavailable(message: impl Into<String>) -> FirewallHealth {
 
 fn input_for_source(source: &UfwSource) -> io::Result<Box<dyn FirewallInput>> {
     match source {
-        UfwSource::Journal => ufw::CommandJournalProcess::spawn()
-            .map(JournalInput::new)
-            .map(|input| Box::new(input) as Box<dyn FirewallInput>),
+        UfwSource::Journal => ufw::journal_input(),
         UfwSource::File(path) => {
             FileInput::open(path).map(|input| Box::new(input) as Box<dyn FirewallInput>)
         }

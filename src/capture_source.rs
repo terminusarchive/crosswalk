@@ -68,7 +68,7 @@ fn group_name_of(path: &Path) -> Option<String> {
     Some(name.to_string_lossy().into_owned())
 }
 
-fn own_user_name() -> String {
+pub fn own_user_name() -> String {
     let user = unsafe { libc::getpwuid(libc::geteuid()) };
     if user.is_null() {
         return "$USER".to_owned();

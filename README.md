@@ -2,7 +2,7 @@
 
 Crosswalk shows what your Linux machine is doing on the network, live, in one terminal window.
 
-See how much bandwidth you are using, which apps are talking to which hosts, which ports are open and whether UFW lets traffic reach them, what the firewall has blocked, and which machines and Wi-Fi networks are nearby. Switch between 25 built-in themes with one key.
+See how much bandwidth you are using, which apps are talking to which hosts, which ports are open and whether your firewall lets traffic reach them, what the firewall has blocked, and which machines and Wi-Fi networks are nearby. Switch between 25 built-in themes with one key.
 
 Crosswalk only watches. It never changes a firewall rule and never writes traffic history to disk.
 
@@ -18,12 +18,12 @@ The screenshots use made-up data, in the synthwave, tokyo-night and catppuccin t
 
 - Linux, Rust and Cargo (edition 2024), and a C toolchain.
 - libpcap development files (`libpcap-dev` on Debian and Ubuntu).
-- Packet-capture privilege: run with `sudo`, grant two capabilities once, or let Wireshark's `dumpcap` capture (see [Running without sudo](#running-without-sudo)).
-- UFW and `journalctl` for the firewall panes. Crosswalk reads UFW's files and never runs `ufw`.
+- Packet-capture privilege: run with `sudo`, grant one capability once, or let Wireshark's `dumpcap` capture (see [Running without sudo](#running-without-sudo)).
+- Optional: UFW or firewalld for the firewall panes, and `journalctl` for their blocks. Neither firewall is required. Crosswalk reads UFW's files, and asks firewalld through `busctl` (part of systemd); it never runs `ufw` or `firewall-cmd`.
 - `ip` (iproute2) for Neighbors.
 - Optional: `nmcli` (NetworkManager) for Wi-Fi Networks.
 
-Tested with Arch Linux (Linux 7.2.9), Rust 1.98.1, libpcap 1.11.0, UFW 0.36.2, NetworkManager 1.58.1, iproute2 7.2.0 and systemd 262. Other versions may work but have not been tried.
+Tested with Arch Linux (Linux 7.2.9), Rust 1.98.1, libpcap 1.11.0, UFW 0.36.2, NetworkManager 1.58.1, iproute2 7.2.0 and systemd 262. firewalld was tested separately: firewalld 2.4.4 on Fedora 44, in a virtual machine. UFW is the firewall on the development machine. Other versions may work but have not been tried.
 
 ## Install
 
@@ -34,7 +34,7 @@ sudo ~/.cargo/bin/crosswalk
 
 `cargo install` builds the release binary into `~/.cargo/bin/crosswalk`. Run it by its full path, because `sudo` does not search `~/.cargo/bin`. After the `setcap` grant below, plain `crosswalk` works.
 
-Remove it with `cargo uninstall crosswalk`. An installed copy has no capabilities, so grant them again after every install.
+Remove it with `cargo uninstall crosswalk`. An installed copy has no capability, so grant it again after every install.
 
 To build from a clone:
 
@@ -49,33 +49,30 @@ Use `--config config.example.toml` for a configuration file. Command-line option
 
 ## Running without sudo
 
-Crosswalk needs privilege to capture packets and to see which process owns another user's socket. Grant just those to the binary once, then run it as yourself:
+Crosswalk needs privilege to capture packets. Grant just that to the binary once, then run it as yourself:
 
 ```sh
-sudo setcap cap_net_raw,cap_sys_ptrace+ep <path to the crosswalk binary>
+sudo setcap cap_net_raw+ep <path to the crosswalk binary>
 ```
 
 Crosswalk does not run `setcap` for you. Without `cap_net_raw`, and with no `dumpcap` it may run, it prints this command and exits. Replacing the file clears the grant, so repeat the command after each build or install.
 
-- `cap_net_raw` lets Crosswalk capture packets.
-- `cap_sys_ptrace` lets it name other users' programs. It can read and control any process, root's included, so it is close to root-equivalent. Grant it only to a binary you trust.
+`cap_net_raw` lets Crosswalk capture packets, and it is the only capability Crosswalk uses. Crosswalk takes nothing into effect while it reads its configuration, uses `cap_net_raw` once to open the capture, then gives up every capability on every thread.
 
-`cap_net_raw` alone works. Other users' programs are then counted as not attributed.
+Without `sudo`, Crosswalk names only your own programs, and the header reads `apps (<user>)`. That is the ordinary state. Other users' traffic is counted as not attributed. With `sudo` the header reads `apps` and every user's programs are named.
 
-Crosswalk gives up `cap_net_raw` once the capture is open, and puts `cap_sys_ptrace` in effect only while it scans `/proc`.
-
-The grant belongs to the file. Anyone who can write to the file can run their own code with these capabilities. For a hardened install, copy the binary to a root-owned place first:
+The grant belongs to the file. Anyone who can write to the file can run their own code with this capability. For a hardened install, copy the binary to a root-owned place first:
 
 ```sh
 sudo groupadd crosswalk
 sudo usermod -aG crosswalk "$USER"
 sudo install -o root -g crosswalk -m 0750 target/release/crosswalk /usr/local/bin/crosswalk
-sudo setcap cap_net_raw,cap_sys_ptrace+ep /usr/local/bin/crosswalk
+sudo setcap cap_net_raw+ep /usr/local/bin/crosswalk
 ```
 
 The group takes effect at your next login. Repeat `install` and `setcap` after each build. Remove the grant with `sudo setcap -r <path>`.
 
-The capabilities do not grant access to the kernel journal or to UFW's rule files. The [manual](docs/manual.md#what-you-are-granting) covers both, and what you see when each capability is missing.
+The capability does not grant access to the kernel journal, to UFW's rule files or to firewalld's rules. The [manual](docs/manual.md#what-you-are-granting) covers all three, and what you see with and without `sudo`.
 
 ### Through Wireshark's dumpcap
 
@@ -113,15 +110,17 @@ Traffic page:
 
 - **Bandwidth** (`1`): download and upload for one interface, as a chart.
 - **App Traffic** (`2`): each app's destinations, with rates and totals.
-- **Listening Ports** (`3`): local ports, their owners, and whether UFW lets traffic in.
-- **Firewall Rules** (`4`): UFW's default policies and rules.
+- **Listening Ports** (`3`): local ports, their owners, and whether the firewall lets traffic in.
+- **Firewall Rules** (`4`): UFW's default policies and rules, or firewalld's active zones.
 
 Network & Firewall page:
 
-- **Firewall Blocks** (`5`): inbound packets UFW or the kernel refused.
+- **Firewall Blocks** (`5`): inbound packets the firewall or the kernel refused.
 - **Network Events** (`6`): changes in rules, ports, neighbours and connections.
 - **Wi-Fi Networks** (`7`): access points in range.
 - **Neighbors** (`8`): machines this computer has recently talked to.
+
+Crosswalk reads UFW or firewalld, chosen once at startup, and the header names the one it reads: `firewall (ufw)`, `firewall (fwd)` for firewalld, or `firewall (none)`. A machine with neither is an ordinary state: the firewall panes say that no supported firewall was found, and the rest of the dashboard is unaffected. On most firewalld installs other than desktop ones an ordinary user may read only the zones' names, and `sudo` shows the rules. `--firewall-provider` (`auto`, `ufw`, `firewalld` or `none`) overrides the choice.
 
 ## More
 

@@ -4,43 +4,35 @@ mod common;
 
 use crosswalk::privileges::{
     Capabilities, capabilities_from_status, enable_net_raw, enable_net_raw_if_available,
-    give_up_everything, missing_net_raw_message, thread_capabilities, with_sys_ptrace,
+    give_up_everything, missing_net_raw_message, thread_capabilities,
 };
 
 fn caps(mask: &str) -> Option<Capabilities> {
     capabilities_from_status(&format!("Name:\tx\nCapEff:\t{mask}\nCapBnd:\t0\n"))
 }
 
-fn both(net_raw: bool, sys_ptrace: bool) -> Option<Capabilities> {
-    Some(Capabilities {
-        net_raw,
-        sys_ptrace,
-    })
+fn net_raw(held: bool) -> Option<Capabilities> {
+    Some(Capabilities { net_raw: held })
 }
 
 #[test]
-fn both_capabilities_are_read_from_the_effective_mask() {
-    assert_eq!(caps("0000000000082000"), both(true, true));
+fn net_raw_is_read_from_the_effective_mask() {
+    assert_eq!(caps("0000000000002000"), net_raw(true));
 }
 
 #[test]
-fn only_net_raw_is_read_from_the_effective_mask() {
-    assert_eq!(caps("0000000000002000"), both(true, false));
-}
-
-#[test]
-fn only_sys_ptrace_is_read_from_the_effective_mask() {
-    assert_eq!(caps("0000000000080000"), both(false, true));
+fn a_mask_without_net_raw_reads_as_not_held() {
+    assert_eq!(caps("0000000000080000"), net_raw(false));
 }
 
 #[test]
 fn no_capabilities_is_not_unknown() {
-    assert_eq!(caps("0000000000000000"), both(false, false));
+    assert_eq!(caps("0000000000000000"), net_raw(false));
 }
 
 #[test]
-fn a_root_mask_holds_both() {
-    assert_eq!(caps("000001ffffffffff"), both(true, true));
+fn a_root_mask_holds_net_raw() {
+    assert_eq!(caps("000001ffffffffff"), net_raw(true));
 }
 
 #[test]
@@ -56,8 +48,8 @@ fn an_unparsable_capeff_is_unknown() {
 #[test]
 fn the_message_gives_the_command_with_the_path_and_names_sudo_as_the_alternative() {
     let message = missing_net_raw_message("/opt/crosswalk");
-    assert!(message.contains("sudo setcap cap_net_raw,cap_sys_ptrace+ep /opt/crosswalk\n"));
-    assert!(message.contains("cap_net_raw"));
+    assert!(message.contains("sudo setcap cap_net_raw+ep /opt/crosswalk\n"));
+    assert!(!message.contains("cap_sys_ptrace"));
     assert!(message.contains("run Crosswalk with sudo"));
 }
 
@@ -169,11 +161,6 @@ fn putting_net_raw_in_effect_where_it_is_not_available_does_nothing() {
     .unwrap();
 }
 
-#[test]
-fn a_closure_run_with_sys_ptrace_still_runs_when_the_thread_lacks_it() {
-    assert_eq!(with_sys_ptrace(|| 7).unwrap(), 7);
-}
-
 fn binary_is_granted_capabilities() -> bool {
     common::binary_is_granted_capabilities(BINARY) && !is_root()
 }
@@ -226,9 +213,6 @@ fn an_attribution_log_only_cap_sys_ptrace_could_reach_is_refused() {
     refused_with_permission_error(output);
     assert!(!created, "the log was created");
 }
-
-const CAP_NET_RAW_BIT: u64 = 1 << 13;
-const CAP_SYS_PTRACE_BIT: u64 = 1 << 19;
 
 /// One thread's name and sets, as `/proc/<pid>/task/<tid>/status` shows them.
 struct ThreadReading {
@@ -293,12 +277,6 @@ fn dashboard_thread_readings(
     readings
 }
 
-/// Thread names are cut to 15 characters by the kernel.
-const SCANNING_THREADS: [&str; 2] = ["crosswalk-captu", "crosswalk-metri"];
-
-/// How many readings of a scanning thread there were, and in how many it had nothing in effect.
-type EffectTally = std::collections::HashMap<String, (u32, u32)>;
-
 /// Every thread reading taken after the dashboard had settled, with the time it was taken.
 fn settled_threads(
     readings: &[(std::time::Duration, Vec<ThreadReading>)],
@@ -310,41 +288,22 @@ fn settled_threads(
         .flat_map(|(at, threads)| threads.iter().map(move |thread| (*at, thread)))
 }
 
-fn judge_thread(tally: &mut EffectTally, thread: &ThreadReading, at: std::time::Duration) {
-    let held = thread.effective | thread.permitted;
-    assert_eq!(held & CAP_NET_RAW_BIT, 0, "{} at {at:?}", thread.name);
-    if !SCANNING_THREADS.contains(&thread.name.as_str()) {
-        assert_eq!(held & CAP_SYS_PTRACE_BIT, 0, "{} at {at:?}", thread.name);
-        return;
-    }
-    let (total, empty) = tally.entry(thread.name.clone()).or_default();
-    *total += 1;
-    *empty += u32::from(thread.effective == 0);
-}
-
-/// A debug-build scan can take most of the time, so only a thread that never lets go fails.
-fn assert_sometimes_out_of_effect(tally: &EffectTally, name: &str) {
-    let (total, empty) = tally.get(name).copied().unwrap_or_default();
-    assert!(total > 0, "{name} was never seen");
-    assert!(
-        empty * 10 >= total,
-        "{name} had cap_sys_ptrace in effect in {} of {total} readings",
-        total - empty
-    );
+fn judge_thread(thread: &ThreadReading, at: std::time::Duration) {
+    assert_eq!(thread.effective, 0, "{} at {at:?}", thread.name);
+    assert_eq!(thread.permitted, 0, "{} at {at:?}", thread.name);
 }
 
 #[test]
-fn each_thread_keeps_only_the_capabilities_it_uses() {
+fn no_thread_holds_any_capability_once_the_dashboard_has_settled() {
     if !binary_is_granted_capabilities() {
         eprintln!("skipped: the binary holds no file capabilities");
         return;
     }
     let readings = dashboard_thread_readings(std::time::Duration::from_secs(3));
-    let mut tally = EffectTally::new();
+    let mut seen = 0;
     for (at, thread) in settled_threads(&readings) {
-        judge_thread(&mut tally, thread, at);
+        judge_thread(thread, at);
+        seen += 1;
     }
-    for name in SCANNING_THREADS {
-        assert_sometimes_out_of_effect(&tally, name);
-    }
+    assert!(seen > 0, "no thread was read after the first second");
 }

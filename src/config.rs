@@ -11,7 +11,10 @@ use crate::ui::{Theme, theme::parse_hex};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FirewallProvider {
+    Auto,
     Ufw,
+    Firewalld,
+    None,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +107,7 @@ impl Config {
         let provider = cli
             .firewall_provider
             .or(file.firewall_provider)
-            .unwrap_or_else(|| "ufw".to_owned());
+            .unwrap_or_else(|| "auto".to_owned());
         let source = cli
             .ufw_source
             .or(file.ufw_source)
@@ -186,9 +189,12 @@ fn build_theme(chosen: Option<String>, file: ThemeFile) -> Result<ThemeChoice, c
 
 fn parse_provider(value: &str) -> Result<FirewallProvider, clap::Error> {
     match value {
+        "auto" => Ok(FirewallProvider::Auto),
         "ufw" => Ok(FirewallProvider::Ufw),
+        "firewalld" => Ok(FirewallProvider::Firewalld),
+        "none" => Ok(FirewallProvider::None),
         other => Err(validation_error(format!(
-            "unsupported firewall provider '{other}'; expected 'ufw'"
+            "unsupported firewall provider '{other}'; expected 'auto', 'ufw', 'firewalld' or 'none'"
         ))),
     }
 }

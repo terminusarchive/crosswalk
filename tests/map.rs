@@ -33,6 +33,7 @@ fn interface(name: &str, addresses: Vec<InterfaceAddress>) -> InterfaceMeasureme
         session_received_bytes: 0,
         session_transmitted_bytes: 0,
         status: InterfaceStatus::Available,
+        is_up: true,
     }
 }
 

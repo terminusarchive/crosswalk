@@ -1,0 +1,1 @@
+{"type":"a{sa{sas}}","data":[{"drop":{"interfaces":[],"sources":["192.168.60.0/24"]},"home":{"interfaces":[],"sources":["192.168.70.0/24"]},"public":{"interfaces":["enp0s2"],"sources":[]},"trusted":{"interfaces":[],"sources":["192.168.50.0/24"]}}]}

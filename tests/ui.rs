@@ -10,11 +10,15 @@ use crosswalk::{
             CaptureHealth, CaptureOrigin, CaptureStatus, Direction, Endpoint, Protocol,
             TrafficEvent,
         },
-        interfaces::{CollectionHealth, InterfaceMeasurement, InterfaceSnapshot, InterfaceStatus},
+        interfaces::{
+            CollectionHealth, InterfaceAddress, InterfaceMeasurement, InterfaceSnapshot,
+            InterfaceStatus,
+        },
     },
     firewall::{
-        FirewallEndpoint, FirewallEvent, FirewallHealth, FirewallOutcome, FirewallStatus, Network,
-        Policy, Rule, RuleAction, RuleDirection, RuleSnapshot, RuleSource,
+        Allowed, FirewallEndpoint, FirewallEvent, FirewallHealth, FirewallStatus, Network, Policy,
+        Rule, RuleAction, RuleDirection, RuleSnapshot, RuleSource, Zone, Zones,
+        firewalld_reply::{ActiveZone, PortRule, Target},
     },
     state::{AppState, Page, Pane, StateLimits},
     ui::{Overview, Theme, draw},
@@ -448,10 +452,10 @@ mod mirrored_chart {
         state::{ByteTotals, RateSample},
         ui::{
             Theme,
-            chart::{Chart, GUTTER_WIDTH},
+            chart::{Chart, GUTTER_WIDTH, shade},
         },
     };
-    use ratatui::{buffer::Buffer, layout::Rect};
+    use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
     const PLOT: u16 = 10;
     const WIDTH: u16 = GUTTER_WIDTH + PLOT;
@@ -466,10 +470,13 @@ mod mirrored_chart {
     }
 
     fn render(samples: &[RateSample], height: u16) -> Buffer {
-        let theme = Theme::default();
+        render_in(samples, height, &Theme::default())
+    }
+
+    fn render_in(samples: &[RateSample], height: u16, theme: &Theme) -> Buffer {
         let area = Rect::new(0, 0, WIDTH, height);
         let mut buffer = Buffer::empty(area);
-        Chart::new(samples, ByteTotals::default(), &theme).render(&mut buffer, area);
+        Chart::new(samples, ByteTotals::default(), theme).render(&mut buffer, area);
         buffer
     }
 
@@ -486,6 +493,121 @@ mod mirrored_chart {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Every built-in theme but `terminal`, which has no RGB colours.
+    fn rgb_themes() -> Vec<Theme> {
+        Theme::NAMES
+            .iter()
+            .filter(|name| **name != "terminal")
+            .map(|name| Theme::named(name).unwrap())
+            .collect()
+    }
+
+    fn channels(colour: Color) -> [i32; 3] {
+        let Color::Rgb(r, g, b) = colour else {
+            panic!("{colour:?} is not RGB")
+        };
+        [r, g, b].map(i32::from)
+    }
+
+    /// How far a colour is from the background, summed over the channels.
+    fn distance(colour: Color, background: Color) -> i32 {
+        let (a, b) = (channels(colour), channels(background));
+        (0..3).map(|n| (a[n] - b[n]).abs()).sum()
+    }
+
+    /// The colour of the inbound bar in a column, from its first row: a full
+    /// block is drawn in it, a partial one over it as a background.
+    fn inbound_tone(buffer: &Buffer, plot_x: u16) -> Color {
+        let cell = &buffer[(GUTTER_WIDTH + plot_x, 4)];
+        if cell.symbol() == "█" {
+            cell.fg
+        } else {
+            cell.bg
+        }
+    }
+
+    #[test]
+    fn a_bar_at_the_peak_is_the_themes_colour_exactly() {
+        for theme in rgb_themes() {
+            for colour in [theme.outbound, theme.inbound] {
+                assert_eq!(shade(colour, theme.background, 1.0), colour);
+            }
+        }
+    }
+
+    #[test]
+    fn the_smallest_bar_is_dimmer_than_the_colour_and_still_distinct_from_the_background() {
+        for theme in rgb_themes() {
+            for colour in [theme.outbound, theme.inbound] {
+                let floor = shade(colour, theme.background, 0.0);
+                assert_ne!(floor, theme.background, "{theme:?}");
+                assert!(distance(floor, theme.background) < distance(colour, theme.background));
+            }
+        }
+    }
+
+    #[test]
+    fn a_taller_bar_is_never_nearer_the_background_than_a_shorter_one() {
+        for theme in rgb_themes() {
+            for colour in [theme.outbound, theme.inbound] {
+                let distances: Vec<i32> = (0..=20)
+                    .map(|n| shade(colour, theme.background, f64::from(n) / 20.0))
+                    .map(|tone| distance(tone, theme.background))
+                    .collect();
+                assert!(
+                    distances.windows(2).all(|pair| pair[0] <= pair[1]),
+                    "{distances:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_colour_that_is_not_rgb_comes_back_unchanged() {
+        let rgb = Color::Rgb(10, 20, 30);
+        assert_eq!(shade(Color::Cyan, Color::Reset, 0.5), Color::Cyan);
+        assert_eq!(shade(Color::Cyan, rgb, 0.5), Color::Cyan);
+        assert_eq!(shade(rgb, Color::Reset, 0.5), rgb);
+    }
+
+    #[test]
+    fn bars_are_shaded_by_their_value_against_the_peak_of_their_own_side() {
+        let theme = Theme::default();
+        // Outbound 1000, 500, 10, 0; inbound 10, 500, 1000, 0.
+        let buffer = render(
+            &[
+                sample(0, 10.0, 1000.0),
+                sample(1, 500.0, 500.0),
+                sample(2, 1000.0, 10.0),
+                sample(3, 0.0, 0.0),
+            ],
+            HEIGHT,
+        );
+        let up = |x: u16| buffer[(GUTTER_WIDTH + PLOT - 4 + x, 2)].fg;
+        let down = |x: u16| inbound_tone(&buffer, PLOT - 4 + x);
+        let from_background = |colour| distance(colour, theme.background);
+        assert_eq!(up(0), theme.outbound);
+        assert!(from_background(up(1)) < from_background(up(0)));
+        assert!(from_background(up(2)) < from_background(up(1)));
+        assert!(from_background(up(2)) > 0);
+        assert!(from_background(down(0)) < from_background(down(1)));
+        assert!(from_background(down(1)) < from_background(down(2)));
+        assert_eq!(down(2), theme.inbound);
+        assert_eq!(symbol(&buffer, PLOT - 1, 2), " ");
+        assert_eq!(symbol(&buffer, PLOT - 1, 4), " ");
+    }
+
+    #[test]
+    fn the_terminal_theme_keeps_flat_bars() {
+        let theme = Theme::named("terminal").unwrap();
+        let samples = [sample(0, 10.0, 1000.0), sample(1, 1000.0, 10.0)];
+        let buffer = render_in(&samples, HEIGHT, &theme);
+        assert_eq!(buffer[(GUTTER_WIDTH + PLOT - 2, 2)].fg, theme.outbound);
+        assert_eq!(buffer[(GUTTER_WIDTH + PLOT - 1, 2)].fg, theme.outbound);
+        assert_eq!(inbound_tone(&buffer, PLOT - 2), theme.inbound);
+        assert_eq!(inbound_tone(&buffer, PLOT - 1), theme.inbound);
     }
 
     #[test]
@@ -514,7 +636,8 @@ mod mirrored_chart {
         // A small non-zero sample is still at least one eighth.
         assert_eq!(symbol(&buffer, PLOT - 2, 2), "▁");
         assert_eq!(symbol(&buffer, PLOT - 1, 4), "▇");
-        assert_eq!(buffer[(GUTTER_WIDTH + PLOT - 1, 4)].bg, theme.inbound);
+        // Its partial cell is the background over a dimmer inbound tone.
+        assert_ne!(buffer[(GUTTER_WIDTH + PLOT - 1, 4)].bg, theme.inbound);
         assert_eq!(buffer[(GUTTER_WIDTH + PLOT - 1, 4)].fg, theme.background);
     }
 
@@ -633,23 +756,16 @@ mod overview {
     fn healthy(state: &mut AppState) {
         state.record_capture_status(CaptureStatus {
             health: CaptureHealth::Available,
-            packets_read: 1,
-            capture_received: 1,
-            capture_dropped: 0,
-            delivery_dropped: 0,
+            dropped: 0,
             origin: CaptureOrigin::Own,
         });
         state.record_attribution_status(AttributionStatus {
             health: AttributionHealth::Available,
-            incomplete: false,
-            limited: false,
+            only_user: None,
         });
         state.record_firewall_status(FirewallStatus {
+            name: "ufw",
             health: FirewallHealth::Available,
-            records_read: 1,
-            events_emitted: 1,
-            malformed_records: 0,
-            delivery_dropped: 0,
         });
     }
 
@@ -681,8 +797,6 @@ mod overview {
                 ip: Some("192.0.2.10".parse().unwrap()),
                 port: Some(port),
             },
-            process: None,
-            outcome: FirewallOutcome::Blocked,
         }
     }
 
@@ -713,6 +827,7 @@ mod overview {
                         session_received_bytes: 4_000_000 + second * 1000,
                         session_transmitted_bytes: 900_000 + second * 100,
                         status: InterfaceStatus::Available,
+                        is_up: true,
                     },
                     InterfaceMeasurement {
                         name: "lo".into(),
@@ -722,6 +837,7 @@ mod overview {
                         session_received_bytes: 10,
                         session_transmitted_bytes: 10,
                         status: InterfaceStatus::Available,
+                        is_up: true,
                     },
                 ],
                 default_route: Some("wlan0".into()),
@@ -1079,7 +1195,7 @@ mod overview {
 
         state.record_listeners(vec![listener(22, "0.0.0.0", Some(claude))], 32_768..=60_999);
         let rows = listening_rows(&state, &theme, "");
-        assert_eq!(rows[0].cells[1].text, "claude");
+        assert_eq!(rows[0].cells[0].text, "claude");
         let rows = listening_zoom_rows(&state, &theme, "");
         assert!(rows[0].cells[6].text.contains("2.1.296"));
     }
@@ -2064,7 +2180,7 @@ mod overview {
     #[test]
     fn the_header_shows_four_sources_and_the_footer_shows_the_keys() {
         let text = lines(&draw_at(&sample(), 110, 24));
-        for visible in ["CROSSWALK", "capture", "firewall", "interfaces", "apps"] {
+        for visible in ["capture", "firewall", "interfaces", "apps"] {
             assert!(text[0].contains(visible), "{visible}: {}", text[0]);
         }
         let footer = &text[23];
@@ -2108,20 +2224,216 @@ mod overview {
         &header[..header.find('●').unwrap()]
     }
 
-    #[test]
-    fn the_longest_name_fits_beside_99_plus_blocks_and_all_four_indicators_at_110() {
+    /// Dumpcap capture, ufw, and `user` on the apps indicator, with 100 blocks.
+    fn full_indicators(user: &str) -> AppState {
         let mut state = AppState::new(StateLimits::default()).unwrap();
         block_n(&mut state, 100);
-        let mut i = Interaction::default().with_theme("catppuccin-latte", &[]);
+        state.record_capture_status(capture_status(
+            CaptureHealth::Available,
+            CaptureOrigin::Dumpcap,
+        ));
+        state.record_firewall_status(firewall_status("ufw", FirewallHealth::Available));
+        attribution(&mut state, AttributionHealth::Available, Some(user));
+        state
+    }
+
+    #[test]
+    fn the_longest_labels_fit_beside_99_plus_blocks_and_all_four_indicators_at_110() {
+        let state = full_indicators("ryan");
+        let mut i = Interaction::default();
         let header = header_of(&screen(&state, &mut i, None, 110, 24));
         assert!(
-            header.contains(" CROSSWALK  Traffic · Network & Firewall 99+ "),
+            header.starts_with(" Traffic · Network & Firewall 99+ "),
             "{header:?}"
         );
         assert!(
             header
                 .trim_end()
-                .ends_with("catppuccin-latte  ● capture  ● firewall  ● interfaces  ● apps"),
+                .ends_with("● capture (dumpcap)  ● firewall (ufw)  ● interfaces  ● apps (ryan)"),
+            "{header:?}"
+        );
+    }
+
+    #[test]
+    fn neither_the_title_nor_the_theme_name_is_in_the_header_at_any_width() {
+        let state = full_indicators("ryan");
+        for width in [110, 200] {
+            let mut i = Interaction::default();
+            let header = header_of(&screen(&state, &mut i, None, width, 24));
+            assert!(
+                !header.contains("CROSSWALK") && !header.contains("synthwave"),
+                "{width}: {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_name_too_long_for_the_header_is_cut_with_an_ellipsis_and_the_left_stays_whole() {
+        let state = full_indicators(&"a".repeat(32));
+        let mut i = Interaction::default();
+        let header = header_of(&screen(&state, &mut i, None, 110, 24));
+        assert!(
+            header.starts_with(" Traffic · Network & Firewall 99+ "),
+            "{header:?}"
+        );
+        assert!(header.contains("● apps (a"), "{header:?}");
+        assert!(header.trim_end().ends_with("…)"), "{header:?}");
+        assert!(!header.contains(&"a".repeat(32)), "{header:?}");
+        assert!(header.contains("● capture (dumpcap)  ● firewall (ufw)  ● interfaces  "));
+    }
+
+    #[test]
+    fn a_user_name_that_fits_is_not_cut() {
+        let state = full_indicators("abcdefghijkl");
+        let mut i = Interaction::default();
+        let header = header_of(&screen(&state, &mut i, None, 110, 24));
+        assert!(header.contains("● apps (abcdefghijkl)"), "{header:?}");
+    }
+
+    /// A capture status of `health` and `origin` that dropped `dropped` packets, at 100 s.
+    fn dropping(health: CaptureHealth, origin: CaptureOrigin, dropped: u64) -> AppState {
+        let mut state = AppState::new(StateLimits::default()).unwrap();
+        state.advance_time(Duration::from_secs(100));
+        state.record_capture_status(CaptureStatus {
+            dropped,
+            ..capture_status(health, origin)
+        });
+        state
+    }
+
+    fn drawn_header(state: &AppState) -> (Terminal<TestBackend>, String) {
+        let mut i = Interaction::default();
+        let terminal = screen(state, &mut i, None, 110, 24);
+        let header = header_of(&terminal);
+        (terminal, header)
+    }
+
+    #[test]
+    fn recent_drops_put_their_count_on_the_capture_indicator_in_the_warning_colour() {
+        let state = dropping(CaptureHealth::Available, CaptureOrigin::Own, 340);
+        let (terminal, header) = drawn_header(&state);
+        assert!(header.contains("● capture (340 dropped)  ● "), "{header:?}");
+        assert_eq!(
+            header_style(&terminal, "●").fg,
+            Theme::default().warning().fg
+        );
+    }
+
+    #[test]
+    fn recent_drops_through_dumpcap_follow_the_source_name() {
+        let state = dropping(CaptureHealth::Available, CaptureOrigin::Dumpcap, 340);
+        let (_, header) = drawn_header(&state);
+        assert!(
+            header.contains("● capture (dumpcap, 340 dropped)  ● "),
+            "{header:?}"
+        );
+    }
+
+    #[test]
+    fn eleven_seconds_after_the_last_drop_the_capture_indicator_is_as_before() {
+        let mut state = dropping(CaptureHealth::Available, CaptureOrigin::Dumpcap, 340);
+        let (before, _) = drawn_header(&dropping(
+            CaptureHealth::Available,
+            CaptureOrigin::Dumpcap,
+            0,
+        ));
+        state.advance_time(Duration::from_secs(111));
+        let (terminal, header) = drawn_header(&state);
+        assert!(header.contains("● capture (dumpcap)  ● "), "{header:?}");
+        assert_eq!(
+            header_style(&terminal, "●").fg,
+            header_style(&before, "●").fg
+        );
+    }
+
+    #[test]
+    fn a_capture_that_is_degraded_or_stopped_keeps_its_colour_and_gains_the_count() {
+        for health in [
+            CaptureHealth::Degraded("lost packets".into()),
+            CaptureHealth::Cancelled,
+        ] {
+            let (own, _) = drawn_header(&dropping(health.clone(), CaptureOrigin::Own, 0));
+            let (terminal, header) = drawn_header(&dropping(health, CaptureOrigin::Own, 340));
+            assert!(header.contains("● capture (340 dropped)  ● "), "{header:?}");
+            assert_eq!(header_style(&terminal, "●").fg, header_style(&own, "●").fg);
+        }
+    }
+
+    #[test]
+    fn a_large_drop_count_is_shortened() {
+        for (dropped, shown) in [(999, "999"), (1_234, "1.2k"), (2_500_000, "2.5M")] {
+            let state = dropping(CaptureHealth::Available, CaptureOrigin::Own, dropped);
+            let (_, header) = drawn_header(&state);
+            assert!(
+                header.contains(&format!("capture ({shown} dropped)")),
+                "{header:?}"
+            );
+        }
+    }
+
+    /// Dumpcap capture dropping 1 234 packets, `firewall`, the user and 100 blocks.
+    fn tight_header(firewall: &'static str, user: &str, width: u16) -> String {
+        let mut state = AppState::new(StateLimits::default()).unwrap();
+        state.advance_time(Duration::from_secs(100));
+        block_n(&mut state, 100);
+        state.record_capture_status(CaptureStatus {
+            dropped: 1_234,
+            ..capture_status(CaptureHealth::Available, CaptureOrigin::Dumpcap)
+        });
+        state.record_firewall_status(firewall_status(firewall, FirewallHealth::Available));
+        attribution(&mut state, AttributionHealth::Available, Some(user));
+        let mut i = Interaction::default();
+        header_of(&screen(&state, &mut i, None, width, 24))
+    }
+
+    #[test]
+    fn when_the_header_is_tight_dumpcap_gives_way_before_the_user_name() {
+        let header = tight_header("ufw", "ryan", 110);
+        assert!(
+            header.starts_with(" Traffic · Network & Firewall 99+ "),
+            "{header:?}"
+        );
+        assert!(
+            header.trim_end().ends_with(
+                "● capture (1.2k dropped)  ● firewall (ufw)  ● interfaces  ● apps (ryan)"
+            ),
+            "{header:?}"
+        );
+    }
+
+    #[test]
+    fn when_dumpcap_alone_does_not_make_room_the_user_name_is_cut_too() {
+        let header = tight_header("ufw", &"a".repeat(32), 110);
+        assert!(
+            header.starts_with(" Traffic · Network & Firewall 99+ "),
+            "{header:?}"
+        );
+        assert!(
+            header.contains("● capture (1.2k dropped)  ● "),
+            "{header:?}"
+        );
+        assert!(header.trim_end().ends_with("…)"), "{header:?}");
+        assert!(!header.contains(&"a".repeat(32)), "{header:?}");
+    }
+
+    #[test]
+    fn with_room_dumpcap_stays_beside_the_drop_count() {
+        let header = tight_header("ufw", "ryan", 130);
+        assert!(
+            header.contains("● capture (dumpcap, 1.2k dropped)  ● "),
+            "{header:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_firewall_label_at_110_columns_is_not_drawn_over_the_left_side() {
+        let header = tight_header("nftables", "ryan", 110);
+        assert!(
+            header.starts_with(" Traffic · Network & Firewall 99+ ●"),
+            "{header:?}"
+        );
+        assert!(
+            header.contains("● firewall (nftables)  ● interfaces  ● apps (r…)"),
             "{header:?}"
         );
     }
@@ -2133,7 +2445,6 @@ mod overview {
         let mut i = Interaction::default();
         let header = header_of(&screen(&state, &mut i, None, 110, 24));
         for visible in [
-            "CROSSWALK",
             "Traffic",
             "Network & Firewall",
             "99+",
@@ -2285,23 +2596,462 @@ mod overview {
         assert!(text.contains("142.250.80.46"), "App Traffic lost its rows");
     }
 
+    fn firewall_status(name: &'static str, health: FirewallHealth) -> FirewallStatus {
+        FirewallStatus { name, health }
+    }
+
+    /// The sample dashboard as it is on a machine with no supported firewall.
+    fn without_firewall() -> AppState {
+        let mut state = sample();
+        state.record_firewall_status(firewall_status("none", FirewallHealth::NoFirewall));
+        state.record_rules(RuleSnapshot::NoFirewall);
+        state
+    }
+
+    #[test]
+    fn the_header_names_ufw_at_each_level_it_has() {
+        let theme = Theme::default();
+        for (health, colour) in [
+            (FirewallHealth::Available, theme.ok),
+            (FirewallHealth::AwaitingEvents, theme.ok),
+            (FirewallHealth::Disabled("off".into()), theme.warning),
+            (FirewallHealth::Degraded("partly".into()), theme.warning),
+            (FirewallHealth::Unavailable("denied".into()), theme.danger),
+            (FirewallHealth::Cancelled, theme.danger),
+        ] {
+            let mut state = sample();
+            state.record_firewall_status(firewall_status("ufw", health.clone()));
+            let terminal = draw_at(&state, 110, 24);
+            let header = header_of(&terminal);
+            assert!(header.contains("firewall (ufw)"), "{health:?}: {header:?}");
+            let dot = header.find("● firewall (ufw)").expect("dot before name");
+            let x = header[..dot].chars().count() as u16;
+            assert_eq!(
+                terminal.backend().buffer()[(x, 0)].style().fg,
+                Some(colour),
+                "{health:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn firewalld_not_logging_denied_packets_keeps_the_header_healthy_and_the_blocks_pane_says_so() {
+        let theme = Theme::default();
+        let cases = [
+            (
+                FirewallHealth::NotLogging,
+                "firewalld is not logging denied packets",
+                "sudo firewall-cmd --set-log-denied=all",
+            ),
+            (
+                FirewallHealth::DependsOnLogging,
+                "Blocks show only if firewalld logs denied packets",
+                "sudo firewall-cmd --set-log-denied=all",
+            ),
+        ];
+        for (health, sentence, command) in cases {
+            let mut state = sample();
+            state.record_firewall_status(firewall_status("fwd", health.clone()));
+            let terminal = draw_at(&state, 110, 32);
+            let header = header_of(&terminal);
+            let dot = header.find("● firewall (fwd)").expect("dot before name");
+            let x = header[..dot].chars().count() as u16;
+            assert_eq!(
+                terminal.backend().buffer()[(x, 0)].style().fg,
+                Some(theme.ok),
+                "{health:?}"
+            );
+            let text = all_pages(&state, 200, 50);
+            assert!(text.contains(sentence), "{health:?}: {text}");
+            assert!(text.contains(command), "{health:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn the_header_names_none_in_the_muted_colour() {
+        let theme = Theme::default();
+        let terminal = draw_at(&without_firewall(), 110, 24);
+        let header = header_of(&terminal);
+        assert!(header.contains("● firewall (none)"), "{header:?}");
+        let x = header[..header.find("● firewall (none)").unwrap()]
+            .chars()
+            .count() as u16;
+        assert_eq!(
+            terminal.backend().buffer()[(x, 0)].style().fg,
+            Some(theme.muted)
+        );
+    }
+
+    #[test]
+    fn with_no_firewall_the_three_panes_say_so_and_nothing_says_it_cannot_read() {
+        let state = without_firewall();
+        let text = all_pages(&state, 250, 50);
+        for line in [
+            "No supported firewall found, so there are no rules to show. See docs/firewall.md",
+            "No supported firewall found, so no blocks are reported. See docs/firewall.md",
+            "No supported firewall found, so exposure is unknown. See docs/firewall.md",
+        ] {
+            assert!(text.contains(line), "missing {line:?}:\n{text}");
+        }
+        assert!(!text.contains("Cannot read firewall rules"), "{text}");
+        let rules = rules_pane(&text, 250);
+        assert!(
+            rules[0].contains("No supported firewall found"),
+            "{rules:?}"
+        );
+        let all = rules.join(" ");
+        assert!(
+            !all.contains("allow") && !all.contains("default:"),
+            "{rules:?}"
+        );
+    }
+
+    #[test]
+    fn with_no_firewall_ports_are_marked_no_firewall_in_muted_and_loopback_ports_stay_local() {
+        let theme = Theme::default();
+        let state = without_firewall();
+        for terminal in listening_screens(&state, &theme) {
+            assert_eq!(
+                marker_style(&terminal, "? no firewall").fg,
+                Some(theme.muted)
+            );
+            assert_eq!(marker_style(&terminal, "· local").fg, Some(theme.muted));
+            let text = lines(&terminal).join("\n");
+            assert!(!text.contains("? unreadable"), "{text}");
+        }
+    }
+
+    fn port_rule(ports: std::ops::RangeInclusive<u16>, protocol: &str) -> PortRule {
+        PortRule {
+            ports,
+            protocol: protocol.to_owned(),
+        }
+    }
+
+    fn zone(name: &str, interfaces: &[&str], sources: &[&str], target: Target) -> Zone {
+        Zone {
+            name: name.to_owned(),
+            interfaces: interfaces.iter().map(|s| (*s).to_owned()).collect(),
+            sources: sources.iter().map(|s| (*s).to_owned()).collect(),
+            target,
+            allowed: vec![],
+            rich_rules: vec![],
+        }
+    }
+
+    /// The sample dashboard on a machine running firewalld, as `snapshot` reads it.
+    fn firewalld_with(snapshot: RuleSnapshot, health: FirewallHealth) -> AppState {
+        let mut state = sample();
+        state.record_interfaces(InterfaceSnapshot {
+            health: CollectionHealth::Available,
+            interfaces: vec![InterfaceMeasurement {
+                name: "wlan0".into(),
+                addresses: vec![InterfaceAddress {
+                    ip: "192.168.1.5".parse().unwrap(),
+                    prefix: 24,
+                }],
+                download_bytes_per_second: 0.0,
+                upload_bytes_per_second: 0.0,
+                session_received_bytes: 0,
+                session_transmitted_bytes: 0,
+                status: InterfaceStatus::Available,
+                is_up: true,
+            }],
+            default_route: Some("wlan0".into()),
+            gateway: None,
+            name_server: None,
+            name_servers: vec![],
+        });
+        state.record_firewall_status(firewall_status("fwd", health));
+        state.record_rules(snapshot);
+        state
+    }
+
+    /// `public` on wlan0 (ssh and a port range, one rich rule) and `work` on a source network
+    /// (everything allowed), with `lab` bound to nothing.
+    fn two_zones() -> RuleSnapshot {
+        let mut public = zone("public", &["wlan0"], &[], Target::Default);
+        public.allowed = vec![
+            Allowed::Service {
+                name: "ssh".into(),
+                ports: vec![port_rule(22..=22, "tcp")],
+            },
+            Allowed::Service {
+                name: "samba".into(),
+                ports: vec![port_rule(139..=139, "tcp"), port_rule(445..=445, "tcp")],
+            },
+            Allowed::Port(port_rule(8000..=8010, "tcp")),
+        ];
+        public.rich_rules = vec![r#"rule source address="192.0.2.9" drop"#.into()];
+        let mut work = zone("work", &[], &["10.9.0.0/16"], Target::Accept);
+        work.allowed = vec![Allowed::Port(port_rule(53..=53, "udp"))];
+        RuleSnapshot::Zones(Zones {
+            default_zone: "public".into(),
+            zones: vec![public, work, zone("lab", &[], &[], Target::Drop)],
+        })
+    }
+
+    #[test]
+    fn the_header_names_fwd_at_each_level_it_has() {
+        let theme = Theme::default();
+        for (health, colour) in [
+            (FirewallHealth::Available, theme.ok),
+            (FirewallHealth::AwaitingEvents, theme.ok),
+            (FirewallHealth::NotLogging, theme.ok),
+            (FirewallHealth::DependsOnLogging, theme.ok),
+            (
+                FirewallHealth::Disabled("firewalld is not running".into()),
+                theme.warning,
+            ),
+            (FirewallHealth::Unavailable("denied".into()), theme.danger),
+        ] {
+            let state = firewalld_with(two_zones(), health.clone());
+            let terminal = draw_at(&state, 110, 24);
+            let header = header_of(&terminal);
+            let dot = header.find("● firewall (fwd)").expect("dot before name");
+            let x = header[..dot].chars().count() as u16;
+            assert_eq!(
+                terminal.backend().buffer()[(x, 0)].style().fg,
+                Some(colour),
+                "{health:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn firewall_rules_shows_a_group_for_each_zone_that_applies_to_something() {
+        let state = firewalld_with(two_zones(), FirewallHealth::NotLogging);
+        let rules = rules_pane(&lines(&draw_at(&state, 110, 50)).join("\n"), 110).join("\n");
+        for line in [
+            "public · wlan0 · default reject",
+            "ssh 22/tcp",
+            "samba 139/tcp, 445/tcp",
+            "port 8000-8010/tcp",
+            r#"rich rule source address="192.0.2.9" drop"#,
+            "work · 10.9.0.0/16 · default accept",
+            "everything is allowed",
+            "port 53/udp",
+        ] {
+            assert!(rules.contains(line), "missing {line:?}:\n{rules}");
+        }
+        assert!(!rules.contains("lab"), "a zone bound to nothing:\n{rules}");
+    }
+
+    #[test]
+    fn a_zone_default_of_drop_reads_drop() {
+        let snapshot = RuleSnapshot::Zones(Zones {
+            default_zone: "dmz".into(),
+            zones: vec![zone("dmz", &["wlan0"], &[], Target::Drop)],
+        });
+        let state = firewalld_with(snapshot, FirewallHealth::NotLogging);
+        let rules = rules_pane(&lines(&draw_at(&state, 110, 30)).join("\n"), 110).join("\n");
+        assert!(rules.contains("dmz · wlan0 · default drop"), "{rules}");
+    }
+
+    #[test]
+    fn a_stopped_firewalld_says_so_in_each_pane_in_the_words_of_the_spec() {
+        let theme = Theme::default();
+        let state = firewalld_with(
+            RuleSnapshot::FirewalldOff,
+            FirewallHealth::Disabled("firewalld is not running".into()),
+        );
+        let text = all_pages(&state, 250, 50);
+        for line in [
+            "firewalld is not running, so there are no rules to show. See docs/firewall.md",
+            "firewalld is not running, so no blocks are reported. See docs/firewall.md",
+            "firewalld is not running, so exposure is unknown. See docs/firewall.md",
+        ] {
+            assert!(text.contains(line), "missing {line:?}:\n{text}");
+        }
+        assert!(
+            !text.contains("UFW") && !text.contains("unreadable"),
+            "{text}"
+        );
+        for terminal in listening_screens(&state, &theme) {
+            assert_eq!(marker_style(&terminal, "? fwd off").fg, Some(theme.muted));
+            assert_eq!(marker_style(&terminal, "· local").fg, Some(theme.muted));
+        }
+    }
+
+    fn zones_only() -> RuleSnapshot {
+        RuleSnapshot::ZonesOnly(vec![
+            ActiveZone {
+                name: "FedoraServer".into(),
+                interfaces: vec!["wlan0".into()],
+                sources: vec![],
+            },
+            ActiveZone {
+                name: "trusted".into(),
+                interfaces: vec![],
+                sources: vec!["10.1.0.0/16".into()],
+            },
+        ])
+    }
+
+    #[test]
+    fn zones_only_names_the_zones_and_explains_in_the_rules_and_ports_panes() {
+        let theme = Theme::default();
+        let state = firewalld_with(zones_only(), FirewallHealth::DependsOnLogging);
+        let text = lines(&draw_at(&state, 250, 50)).join("\n");
+        for line in [
+            "firewalld shows this user only its zones. Run with sudo to see the rules.",
+            "firewalld shows this user only its zones, so exposure is unknown. Run with sudo to see it.",
+            "FedoraServer · wlan0",
+            "trusted · 10.1.0.0/16",
+        ] {
+            assert!(text.contains(line), "missing {line:?}:\n{text}");
+        }
+        assert!(
+            !text.contains("UFW") && !text.contains("unreadable"),
+            "{text}"
+        );
+        for terminal in listening_screens(&state, &theme) {
+            assert_eq!(
+                marker_style(&terminal, "? not readable").fg,
+                Some(theme.muted)
+            );
+            assert_eq!(marker_style(&terminal, "· local").fg, Some(theme.muted));
+        }
+        let header = header_of(&draw_at(&state, 110, 24));
+        assert!(header.contains("● firewall (fwd)"), "{header}");
+    }
+
+    #[test]
+    fn zones_only_keeps_the_healthy_colour() {
+        let theme = Theme::default();
+        let state = firewalld_with(zones_only(), FirewallHealth::DependsOnLogging);
+        let terminal = draw_at(&state, 110, 24);
+        let header = header_of(&terminal);
+        let x = header[..header.find("● firewall (fwd)").unwrap()]
+            .chars()
+            .count() as u16;
+        assert_eq!(
+            terminal.backend().buffer()[(x, 0)].style().fg,
+            Some(theme.ok)
+        );
+    }
+
+    #[test]
+    fn a_port_the_zones_cannot_judge_reads_unknown() {
+        let theme = Theme::default();
+        let snapshot = RuleSnapshot::Zones(Zones {
+            default_zone: "gone".into(),
+            zones: vec![zone("public", &["other0"], &[], Target::Default)],
+        });
+        let state = firewalld_with(snapshot, FirewallHealth::NotLogging);
+        for terminal in listening_screens(&state, &theme) {
+            assert_eq!(marker_style(&terminal, "? unknown").fg, Some(theme.muted));
+            let text = text_of(&terminal);
+            assert!(!text.contains("? unreadable"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_zoom_gives_no_rule_text_for_a_zones_exposure() {
+        let state = firewalld_with(two_zones(), FirewallHealth::NotLogging);
+        let text = listening_screens(&state, &Theme::default())[1..]
+            .iter()
+            .map(text_of)
+            .collect::<String>();
+        assert!(text.contains("◐ limited —"), "{text}");
+        assert!(!text.contains("default policy"), "{text}");
+    }
+
+    #[test]
+    fn what_firewalld_sends_is_cleaned_before_it_is_drawn() {
+        let mut hostile = zone(
+            "pub\u{1b}[31mlic\u{202e}",
+            &["wl\u{1b}[2Jan0"],
+            &["10.0.0.0/8\u{200b}"],
+            Target::Reject,
+        );
+        hostile.allowed = vec![Allowed::Service {
+            name: "ss\u{7}h\u{202e}".into(),
+            ports: vec![port_rule(22..=22, "tcp")],
+        }];
+        hostile.rich_rules = vec![format!(
+            "rule \u{1b}]0;title\u{7}drop\u{202e}{}",
+            "x".repeat(5000)
+        )];
+        let long_name = zone(&"n".repeat(200), &["wlan0"], &[], Target::Drop);
+        let snapshot = RuleSnapshot::Zones(Zones {
+            default_zone: "public".into(),
+            zones: vec![hostile, long_name],
+        });
+        let state = firewalld_with(snapshot, FirewallHealth::NotLogging);
+        let mut zoom = Interaction::default();
+        press(&mut zoom, &state, KeyCode::Char('4'));
+        press(&mut zoom, &state, KeyCode::Enter);
+        for text in [
+            text_of(&draw_at(&state, 110, 30)),
+            text_of(&screen(&state, &mut zoom, None, 200, 30)),
+        ] {
+            for disguise in ['\u{1b}', '\u{7}', '\u{202e}', '\u{200b}'] {
+                assert!(!text.contains(disguise), "{disguise:?} in:\n{text}");
+            }
+            assert!(text.contains("pub[31mlic"), "{text}");
+            assert!(!text.contains(&"n".repeat(60)), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_long_rich_rule_is_cut_with_a_sign_and_does_not_hide_the_next_zone() {
+        let mut first = zone("first", &["wlan0"], &[], Target::Default);
+        first.rich_rules = vec![format!(
+            "rule family=\"ipv4\" {}reject",
+            "source address=\"192.0.2.1\" ".repeat(20)
+        )];
+        let second = zone("second", &["eth9"], &[], Target::Default);
+        let snapshot = RuleSnapshot::Zones(Zones {
+            default_zone: "first".into(),
+            zones: vec![first, second],
+        });
+        let state = firewalld_with(snapshot, FirewallHealth::NotLogging);
+        let rules = rules_pane(&lines(&draw_at(&state, 110, 30)).join("\n"), 110);
+        let rule = rules
+            .iter()
+            .find(|l| l.starts_with("rich"))
+            .expect("the rule");
+        assert!(rule.contains('…'), "{rules:?}");
+        assert!(rule.starts_with("rich rule family"), "{rules:?}");
+        assert!(rule.ends_with("reject"), "the action stays: {rules:?}");
+        assert!(rules.iter().any(|l| l.starts_with("second")), "{rules:?}");
+    }
+
+    #[test]
+    fn zones_below_the_pane_are_counted_in_more() {
+        let mut busy = zone("busy", &["wlan0"], &[], Target::Default);
+        busy.allowed = (1..=40u16)
+            .map(|n| Allowed::Port(port_rule(n..=n, "tcp")))
+            .collect();
+        let snapshot = RuleSnapshot::Zones(Zones {
+            default_zone: "busy".into(),
+            zones: vec![busy],
+        });
+        let state = firewalld_with(snapshot, FirewallHealth::NotLogging);
+        let screen = lines(&draw_at(&state, 110, 30));
+        let title = screen
+            .iter()
+            .position(|l| l.contains("FIREWALL RULES"))
+            .unwrap();
+        let below: String = screen[title..]
+            .iter()
+            .map(|l| l.chars().skip(55).collect::<String>())
+            .collect();
+        assert!(below.contains(" more "), "{below}");
+    }
+
     #[test]
     fn each_dependent_pane_names_its_unhealthy_source_in_plain_words() {
         let mut state = sample();
         state.record_capture_status(CaptureStatus {
             health: CaptureHealth::Degraded("lost packets".into()),
-            packets_read: 0,
-            capture_received: 0,
-            capture_dropped: 0,
-            delivery_dropped: 0,
+            dropped: 0,
             origin: CaptureOrigin::Own,
         });
         state.record_firewall_status(FirewallStatus {
+            name: "ufw",
             health: FirewallHealth::Disabled("logging off".into()),
-            records_read: 0,
-            events_emitted: 0,
-            malformed_records: 0,
-            delivery_dropped: 0,
         });
         state.record_interfaces(InterfaceSnapshot {
             health: CollectionHealth::Unavailable("no /proc".into()),
@@ -2328,8 +3078,7 @@ mod overview {
         let mut state = sample();
         state.record_attribution_status(AttributionStatus {
             health: AttributionHealth::Unavailable("procfs restricted".into()),
-            incomplete: true,
-            limited: false,
+            only_user: None,
         });
         state.record_listeners(vec![], 32_768..=60_999);
         let text = lines(&draw_at(&state, 160, 50)).join("\n");
@@ -2343,8 +3092,7 @@ mod overview {
         healthy(&mut state);
         state.record_attribution_status(AttributionStatus {
             health: AttributionHealth::Unavailable("procfs restricted".into()),
-            incomplete: true,
-            limited: false,
+            only_user: None,
         });
         packet(
             &mut state,
@@ -2372,11 +3120,10 @@ mod overview {
         assert!(text.contains("not attributed: 0 B in, 200 B out"), "{text}");
     }
 
-    fn attribution(state: &mut AppState, health: AttributionHealth, limited: bool) {
+    fn attribution(state: &mut AppState, health: AttributionHealth, only_user: Option<&str>) {
         state.record_attribution_status(AttributionStatus {
             health,
-            incomplete: false,
-            limited,
+            only_user: only_user.map(str::to_owned),
         });
     }
 
@@ -2438,13 +3185,12 @@ mod overview {
     }
 
     #[test]
-    fn app_traffic_at_110_by_24_keeps_its_header_and_three_rows_under_the_limited_notice_and_the_footer()
-     {
+    fn app_traffic_at_110_by_24_keeps_its_header_and_three_rows_above_the_footer() {
         let mut state = three_apps_and_unowned();
-        attribution(&mut state, AttributionHealth::Available, true);
+        attribution(&mut state, AttributionHealth::Available, Some("alice"));
         let pane = app_traffic_pane(&state);
         let text = pane.join("\n");
-        assert!(text.contains("cap_sys_ptrace"), "{text}");
+        assert!(!text.contains("Other users' programs"), "{text}");
         assert!(text.contains("DESTINATION"), "{text}");
         assert_eq!(data_rows_shown(&pane), 3, "{text}");
         assert!(text.contains("not attributed: 0 B in, 40 B out"), "{text}");
@@ -2455,10 +3201,7 @@ mod overview {
         let mut state = three_apps_and_unowned();
         state.record_capture_status(CaptureStatus {
             health: CaptureHealth::Degraded("lost packets".into()),
-            packets_read: 0,
-            capture_received: 0,
-            capture_dropped: 0,
-            delivery_dropped: 0,
+            dropped: 0,
             origin: CaptureOrigin::Own,
         });
         let pane = app_traffic_pane(&state);
@@ -2471,10 +3214,7 @@ mod overview {
     fn capture_status(health: CaptureHealth, origin: CaptureOrigin) -> CaptureStatus {
         CaptureStatus {
             health,
-            packets_read: 0,
-            capture_received: 0,
-            capture_dropped: 0,
-            delivery_dropped: 0,
+            dropped: 0,
             origin,
         }
     }
@@ -2566,7 +3306,7 @@ mod overview {
         attribution(
             &mut state,
             AttributionHealth::Unavailable("procfs restricted".into()),
-            false,
+            None,
         );
         let pane = app_traffic_pane(&state);
         let text = pane.join("\n");
@@ -2582,44 +3322,68 @@ mod overview {
             .fg
     }
 
-    #[test]
-    fn limited_attribution_warns_in_the_header_and_app_traffic_and_keeps_its_rows() {
-        let theme = Theme::default();
-        let mut state = sample();
-        attribution(&mut state, AttributionHealth::Available, true);
-        let terminal = draw_at(&state, 110, 32);
-        let text = lines(&terminal).join("\n");
-        assert_eq!(apps_dot(&terminal), Some(theme.warning), "{text}");
-        for visible in [
-            "Other users' programs cannot be named",
-            "cap_sys_ptrace",
-            "Running without sudo.",
-            "142.250.80.46",
-        ] {
-            assert!(text.contains(visible), "missing {visible:?}:\n{text}");
-        }
+    fn header_line(terminal: &Terminal<TestBackend>) -> String {
+        lines(terminal)
+            .into_iter()
+            .find(|line| line.contains("apps"))
+            .unwrap()
     }
 
     #[test]
-    fn full_attribution_shows_no_limited_line_and_a_healthy_indicator() {
+    fn a_user_who_is_not_root_sees_their_name_on_a_healthy_apps_indicator_and_no_line_about_others()
+    {
         let theme = Theme::default();
         let mut state = sample();
-        attribution(&mut state, AttributionHealth::Available, false);
+        attribution(&mut state, AttributionHealth::Available, Some("alice"));
         let terminal = draw_at(&state, 110, 32);
         let text = lines(&terminal).join("\n");
+        assert!(header_line(&terminal).contains("apps (alice)"), "{text}");
         assert_eq!(apps_dot(&terminal), Some(theme.ok), "{text}");
+        assert!(!text.contains("Other users' programs"), "{text}");
         assert!(!text.contains("cap_sys_ptrace"), "{text}");
+        assert!(text.contains("142.250.80.46"), "{text}");
     }
 
     #[test]
-    fn unavailable_attribution_takes_precedence_over_the_limited_line() {
+    fn root_sees_apps_without_a_name_on_a_healthy_indicator() {
+        let theme = Theme::default();
+        let mut state = sample();
+        attribution(&mut state, AttributionHealth::Available, None);
+        let terminal = draw_at(&state, 110, 32);
+        let text = lines(&terminal).join("\n");
+        assert!(!header_line(&terminal).contains("apps ("), "{text}");
+        assert_eq!(apps_dot(&terminal), Some(theme.ok), "{text}");
+    }
+
+    #[test]
+    fn a_stale_source_keeps_its_warning_and_line_and_the_name() {
+        let theme = Theme::default();
+        let mut state = sample();
+        attribution(
+            &mut state,
+            AttributionHealth::Stale("procfs slow".into()),
+            Some("alice"),
+        );
+        let terminal = draw_at(&state, 110, 32);
+        let text = lines(&terminal).join("\n");
+        assert!(header_line(&terminal).contains("apps (alice)"), "{text}");
+        assert_eq!(apps_dot(&terminal), Some(theme.warning), "{text}");
+        assert!(text.contains("App names are out of date"), "{text}");
+    }
+
+    #[test]
+    fn an_unavailable_source_keeps_its_danger_and_line_and_the_name() {
+        let theme = Theme::default();
         let mut state = sample();
         attribution(
             &mut state,
             AttributionHealth::Unavailable("procfs restricted".into()),
-            true,
+            Some("alice"),
         );
-        let text = lines(&draw_at(&state, 110, 32)).join("\n");
+        let terminal = draw_at(&state, 110, 32);
+        let text = lines(&terminal).join("\n");
+        assert!(header_line(&terminal).contains("apps (alice)"), "{text}");
+        assert_eq!(apps_dot(&terminal), Some(theme.danger), "{text}");
         assert!(text.contains("App names are unavailable"), "{text}");
         assert!(!text.contains("cap_sys_ptrace"), "{text}");
     }
@@ -2721,7 +3485,7 @@ mod overview {
             assert!(text.contains(visible), "missing {visible:?}:\n{text}");
         }
         assert!(!text.contains("+2 more"), "zoom lists every destination");
-        assert!(text.contains("CROSSWALK") && text.contains("capture"));
+        assert!(text.contains("capture"));
     }
 
     #[test]
@@ -3072,7 +3836,7 @@ mod overview {
         let text = text_of(&screen(&state, &mut i, None, 110, 24));
         for visible in [
             // The popup covers only its own box: the titles outside it stay.
-            "CROSSWALK",
+            "Traffic",
             "BANDWIDTH",
             "APP TRAFFIC",
             "HELP",
@@ -3735,7 +4499,7 @@ mod overview {
     fn tables_keep_one_column_of_padding_inside_the_border() {
         let traffic = lines(&draw_at(&sample(), 110, 24));
         let network = lines(&draw_net(&sample(), 110, 24));
-        for header in ["│ APP", "│ PORT", "│ IFACE"] {
+        for header in ["│ APP", "│ IFACE"] {
             assert!(
                 traffic.iter().any(|l| l.contains(header)),
                 "missing {header:?}:\n{}",
@@ -4555,8 +5319,8 @@ mod overview {
         // The 40 characters do not fit beside the other columns: cut, not wrapped.
         assert!(row.contains('…') && !row.contains(&app), "{row}");
         assert!(row.ends_with(" │") && other.ends_with(" │"));
-        assert_eq!(col(&row, "0.0.0.0"), col(&header, "BIND"));
-        assert_eq!(col(&other, "127.0.0.1"), col(&header, "BIND"));
+        assert_eq!(end(&row, "0.0.0.0"), end(&header, "BIND"));
+        assert_eq!(end(&other, "127.0.0.1"), end(&header, "BIND"));
     }
 
     #[test]
@@ -5069,9 +5833,10 @@ mod overview {
         let header = line_with(&text, "PATH");
         let row = line_with(&text, "5353/tcp");
         assert!(
-            col(header, "PORT") < col(header, "APP") && col(header, "APP") < col(header, "PATH")
+            col(header, "APP") < col(header, "BIND")
+                && col(header, "FIREWALL") < col(header, "PATH")
         );
-        assert_eq!(col(row, "0.0.0.0"), col(header, "BIND"));
+        assert_eq!(end(row, "0.0.0.0"), end(header, "BIND"));
         // Firewall Blocks zoom with names off leaves NAME empty.
         let mut state = bare();
         state.record_firewall(
@@ -5306,6 +6071,7 @@ mod overview {
                 session_received_bytes: 4_000_000,
                 session_transmitted_bytes: 900_000,
                 status: InterfaceStatus::Available,
+                is_up: true,
             }],
             default_route: Some("wlan0".into()),
             gateway: None,
@@ -5526,6 +6292,75 @@ mod overview {
             .iter()
             .map(|r| r.chars().skip(55).collect())
             .collect()
+    }
+
+    /// The colours of the SIGNAL cell's eight characters for a network of that
+    /// signal, on the overview (`zoom` false) or in the zoom.
+    fn signal_colours(signal: u8, zoom: bool) -> Vec<Option<ratatui::style::Color>> {
+        use ratatui::style::Color;
+        let state = with_wifi(vec![access_point(
+            Some("Den"),
+            signal,
+            6,
+            2437,
+            "WPA2",
+            false,
+        )]);
+        let terminal = if zoom {
+            let mut i = Interaction::default();
+            press(&mut i, &state, KeyCode::Char('7'));
+            press(&mut i, &state, KeyCode::Enter);
+            screen(&state, &mut i, None, 110, 24)
+        } else {
+            draw_focused(&state, Pane::WifiNetworks, 110, 24)
+        };
+        let buffer = terminal.backend().buffer();
+        let (y, row) = lines(&terminal)
+            .into_iter()
+            .enumerate()
+            .find(|(_, l)| l.contains('▂'))
+            .unwrap();
+        let x = row.chars().take_while(|&c| c != '▂').count();
+        (x..x + 8)
+            .map(|x| match buffer[(x as u16, y as u16)].fg {
+                Color::Reset => None,
+                c => Some(c),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn signal_bars_take_the_colour_of_their_strength_and_the_number_and_dots_do_not() {
+        let theme = Theme::default();
+        let (ok, warning, danger) = (theme.ok, theme.warning, theme.danger);
+        for zoom in [false, true] {
+            for (signal, colour) in [
+                (86, ok),
+                (80, ok),
+                (71, ok),
+                (55, ok),
+                (54, warning),
+                (42, warning),
+                (30, warning),
+                (29, danger),
+                (18, danger),
+            ] {
+                let lit = match signal {
+                    80.. => 4,
+                    55..=79 => 3,
+                    30..=54 => 2,
+                    _ => 1,
+                };
+                let cells = signal_colours(signal, zoom);
+                for (n, cell) in cells.iter().take(4).enumerate() {
+                    let want = if n < lit { colour } else { theme.muted };
+                    assert_eq!(*cell, Some(want), "signal {signal} cell {n} zoom {zoom}");
+                }
+                for cell in &cells[4..] {
+                    assert_eq!(*cell, Some(theme.text), "signal {signal} zoom {zoom}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -6411,8 +7246,8 @@ mod overview {
                 (!l.starts_with(['╰', '└'])).then_some(inner)
             })
             .filter_map(|l| {
-                let first = l.split_whitespace().next()?.to_owned();
-                first.strip_suffix("/tcp")?.parse().ok()
+                l.split_whitespace()
+                    .find_map(|word| word.strip_suffix("/tcp")?.parse().ok())
             })
             .collect()
     }
@@ -6489,10 +7324,10 @@ mod overview {
     }
 
     #[test]
-    fn listening_ports_header_reads_port_app_pid_bind_firewall_with_every_column_shown() {
+    fn listening_ports_header_reads_app_pid_bind_port_firewall_with_every_column_shown() {
         let rows = listening_half();
         let header = app_row(&rows, "FIREWALL");
-        let order = ["PORT", "APP", "PID", "BIND", "FIREWALL"];
+        let order = ["APP", "PID", "BIND", "PORT", "FIREWALL"];
         let at: Vec<usize> = order.iter().map(|c| col(header, c)).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{header}");
     }
@@ -6507,7 +7342,7 @@ mod overview {
         assert_eq!(col(owned, "912"), pid, "{owned}");
         let cell: String = ownerless.chars().skip(pid).take(3).collect();
         assert_eq!(cell.trim_end(), "—", "{ownerless}");
-        assert_eq!(col(owned, "0.0.0.0"), col(header, "BIND"), "{owned}");
+        assert_eq!(end(owned, "0.0.0.0"), end(header, "BIND"), "{owned}");
     }
 
     #[test]
@@ -6885,7 +7720,7 @@ mod overview {
      {
         let (state, mut i) = on_ports();
         let t = view(&state, &mut i);
-        let header = row_of(&t, "PORT     APP");
+        let header = row_of(&t, "BIND     PORT");
         assert_eq!(marked(&t), vec![(header + 1, 2)], "first row selected");
         assert!(line_of(&t, header + 1).contains("1001/tcp"));
         press(&mut i, &state, KeyCode::Char('j'));
@@ -6907,7 +7742,7 @@ mod overview {
         assert_eq!(marked(&t), vec![(header + 4, 2)]);
         assert!(line_of(&t, header + 4).contains("1005/tcp"));
         assert!(line_of(&t, header + 1).contains("1002/tcp"));
-        assert_eq!(row_of(&t, "PORT     APP"), header, "header stays");
+        assert_eq!(row_of(&t, "BIND     PORT"), header, "header stays");
         assert!(
             lines(&t)[header + 5].contains("+5 more"),
             "{}",
@@ -6933,7 +7768,7 @@ mod overview {
     fn on_the_overview_half_page_page_and_home_end_keys_move_as_on_the_ports_pane() {
         // The pane shows four rows: half is two.
         let (state, mut i) = on_ports();
-        let header = row_of(&view(&state, &mut i), "PORT     APP");
+        let header = row_of(&view(&state, &mut i), "BIND     PORT");
         let selected_port = |t: &Terminal<TestBackend>| {
             let m = marked(t);
             assert_eq!(m.len(), 1, "{m:?}");
@@ -7000,7 +7835,7 @@ mod overview {
             // Coming back lands on the first row too.
             press(&mut i, &state, KeyCode::Char('3'));
             let t = view(&state, &mut i);
-            let header = row_of(&t, "PORT     APP");
+            let header = row_of(&t, "BIND     PORT");
             assert_eq!(marked(&t), vec![(header + 1, 2)], "{leave:?}");
         }
         // `p` leaves the pane, and the page, and the way back is to the first row.
@@ -7011,7 +7846,7 @@ mod overview {
         press(&mut i, &state, KeyCode::Char('p'));
         let t = view(&state, &mut i);
         assert_eq!(i.focus(), Pane::ListeningPorts);
-        let header = row_of(&t, "PORT     APP");
+        let header = row_of(&t, "BIND     PORT");
         assert_eq!(marked(&t), vec![(header + 1, 2)]);
     }
 
@@ -7121,7 +7956,7 @@ mod overview {
         assert_eq!(i.selected(), 0);
         press(&mut i, &state, KeyCode::Char('3'));
         let t = view(&state, &mut i);
-        let header = row_of(&t, "PORT     APP");
+        let header = row_of(&t, "BIND     PORT");
         assert_eq!(marked(&t), vec![(header + 1, 2)], "nothing carried over");
     }
 
@@ -7139,7 +7974,7 @@ mod overview {
         view(&state, &mut i);
         press(&mut i, &state, KeyCode::Esc);
         let t = view(&state, &mut i);
-        let header = row_of(&t, "PORT     APP");
+        let header = row_of(&t, "BIND     PORT");
         assert_eq!(marked(&t), vec![(header + 1, 2)]);
     }
 
@@ -7162,7 +7997,7 @@ mod overview {
         press(&mut i, &state, KeyCode::Enter);
         let t = view(&state, &mut i);
         assert_eq!(i.selected(), 0, "the search changed");
-        let header = row_of(&t, "PORT     APP");
+        let header = row_of(&t, "BIND     PORT");
         assert_eq!(marked(&t), vec![(header + 1, 2)]);
         // Move, then clear the search with Esc: back to the first row.
         press(&mut i, &state, KeyCode::Char('j'));
@@ -7269,6 +8104,7 @@ mod connection_title {
                     session_received_bytes: 10,
                     session_transmitted_bytes: 10,
                     status: InterfaceStatus::Available,
+                    is_up: true,
                 })
                 .collect(),
             default_route: default_route.map(Into::into),
@@ -7526,6 +8362,7 @@ mod bandwidth_totals {
                         session_received_bytes: received,
                         session_transmitted_bytes: sent,
                         status: InterfaceStatus::Available,
+                        is_up: true,
                     })
                     .collect(),
                 default_route: Some(interfaces[0].0.into()),
@@ -7882,6 +8719,7 @@ mod steady_columns {
                     session_received_bytes: total,
                     session_transmitted_bytes: total,
                     status: InterfaceStatus::Available,
+                    is_up: true,
                 }],
                 default_route: Some("eth0".into()),
                 gateway: None,
@@ -8504,6 +9342,7 @@ mod map_keys {
             session_received_bytes: 0,
             session_transmitted_bytes: 0,
             status: InterfaceStatus::Available,
+            is_up: true,
         };
         InterfaceSnapshot {
             health: CollectionHealth::Available,
@@ -8939,8 +9778,6 @@ mod map_keys {
                         ip: Some("192.0.2.10".parse().unwrap()),
                         port: Some(22),
                     },
-                    process: None,
-                    outcome: FirewallOutcome::Blocked,
                 },
             );
         }
@@ -9288,6 +10125,47 @@ mod theme_cycling {
         assert!(!footer_at(&mut i, &state).contains("t theme"));
     }
 
+    fn footer_at_width(i: &mut Interaction, state: &AppState, width: u16) -> String {
+        lines(&screen(state, i, None, width, 30)).remove(29)
+    }
+
+    #[test]
+    fn at_130_columns_the_t_hint_names_the_theme_and_follows_t_on_every_view() {
+        let state = state();
+        let mut i = Interaction::default();
+        let footer = footer_at_width(&mut i, &state, 130);
+        assert!(footer.contains("t theme (synthwave)"), "{footer:?}");
+        assert!(
+            footer
+                .trim_end()
+                .ends_with("t theme (synthwave) · ? help · q quit"),
+            "{footer:?}"
+        );
+        press(&mut i, &state, KeyCode::Char('t'));
+        let footer = footer_at_width(&mut i, &state, 130);
+        assert!(footer.contains("t theme (dracula)"), "{footer:?}");
+        assert!(!footer.contains("synthwave"), "{footer:?}");
+        press(&mut i, &state, KeyCode::Enter);
+        let footer = footer_at_width(&mut i, &state, 130);
+        assert!(footer.contains("t theme (dracula)"), "zoom: {footer:?}");
+        press(&mut i, &state, KeyCode::Esc);
+        press(&mut i, &state, KeyCode::Char('m'));
+        let footer = footer_at_width(&mut i, &state, 130);
+        assert!(footer.contains("t theme (dracula)"), "map: {footer:?}");
+    }
+
+    #[test]
+    fn at_110_columns_on_the_main_page_the_t_hint_is_plain() {
+        let state = state();
+        let mut i = Interaction::default();
+        let footer = footer_at(&mut i, &state);
+        assert!(
+            footer.trim_end().ends_with("t theme · ? help · q quit"),
+            "{footer:?}"
+        );
+        assert!(!footer.contains('('), "{footer:?}");
+    }
+
     #[test]
     fn the_footer_keeps_every_other_hint_on_wi_fi_where_t_does_not_fit() {
         let state = state();
@@ -9331,49 +10209,17 @@ mod theme_cycling {
         lines(&screen(state, i, None, 110, 24)).remove(0)
     }
 
-    /// The text from the theme's name to the end of the indicators.
-    fn name_then_indicators(header: &str, name: &str) -> bool {
-        header.trim_end().ends_with(&format!(
-            "{name}  ● capture  ● firewall  ● interfaces  ● apps"
-        ))
-    }
-
     #[test]
-    fn the_header_shows_the_theme_before_the_indicators_and_follows_t() {
+    fn the_header_never_shows_the_theme_name_whichever_theme_is_in_use() {
         let state = state();
         let mut i = Interaction::default();
-        assert!(name_then_indicators(&header(&mut i, &state), "synthwave"));
-        press(&mut i, &state, KeyCode::Char('t'));
-        assert!(name_then_indicators(&header(&mut i, &state), "dracula"));
-        let mut i = Interaction::default().with_theme("gruvbox", &[]);
-        assert!(name_then_indicators(&header(&mut i, &state), "gruvbox"));
-    }
-
-    #[test]
-    fn the_header_shows_the_theme_in_muted_on_both_pages_in_zoom_on_the_map_and_with_help_open() {
-        let state = state();
-        let mut i = Interaction::default().with_theme("nord", &[]);
-        let check = |i: &mut Interaction, what: &str| {
-            let terminal = screen(&state, i, None, 110, 24);
-            let header = lines(&terminal).remove(0);
-            assert!(name_then_indicators(&header, "nord"), "{what}: {header:?}");
-            let x = header.find("nord").unwrap() as u16;
-            assert_eq!(
-                terminal.backend().buffer()[(x, 0)].fg,
-                Theme::default().muted().fg.unwrap(),
-                "{what}"
+        for _ in 0..2 {
+            let header = header(&mut i, &state);
+            assert!(
+                !Theme::NAMES.iter().any(|name| header.contains(name)),
+                "{header:?}"
             );
-        };
-        check(&mut i, "traffic");
-        press(&mut i, &state, KeyCode::Enter);
-        check(&mut i, "zoom");
-        press(&mut i, &state, KeyCode::Esc);
-        press(&mut i, &state, KeyCode::Char('5'));
-        check(&mut i, "network and firewall");
-        press(&mut i, &state, KeyCode::Char('m'));
-        check(&mut i, "map");
-        press(&mut i, &state, KeyCode::Esc);
-        press(&mut i, &state, KeyCode::Char('?'));
-        check(&mut i, "help");
+            press(&mut i, &state, KeyCode::Char('t'));
+        }
     }
 }

@@ -5,6 +5,7 @@ pub mod map;
 pub mod panes;
 pub mod table;
 pub mod theme;
+mod zone_rows;
 
 pub use input::Interaction;
 pub use theme::Theme;
@@ -374,7 +375,7 @@ fn list_pane<'a>(state: &AppState, theme: &Theme, view: &Overview<'_>, pane: Pan
             list.empty = panes::neighbors_empty(state);
         }
         Pane::FirewallRules => {
-            list.columns = panes::rule_columns();
+            list.columns = panes::rules_columns(state);
             list.rows = panes::rule_rows(state, theme, search);
             list.empty = panes::rules_empty(state);
         }
@@ -409,8 +410,7 @@ fn draw_header(
         }
     };
     let mut left = vec![
-        Span::styled(" CROSSWALK", theme.focus()),
-        Span::raw("  "),
+        Span::raw(" "),
         Span::styled("Traffic", shown(Page::Traffic)),
         Span::styled(" · ", theme.muted()),
         Span::styled("Network & Firewall", shown(Page::NetworkFirewall)),
@@ -424,12 +424,14 @@ fn draw_header(
         left.push(Span::raw(" "));
         left.push(Span::styled(count, theme.warning()));
     }
+    let room = usize::from(area.width).saturating_sub(Line::from(left.clone()).width() + 1);
     frame.render_widget(Paragraph::new(Line::from(left)), area);
-    let mut spans = vec![Span::styled(
-        format!("{}  ", view.theme_name),
-        theme.muted(),
-    )];
-    for (name, level) in panes::indicators(state) {
+    let mut spans = Vec::new();
+    let mut indicators = panes::indicators(state, false);
+    if indicators_width(&indicators) > room {
+        indicators = panes::indicators(state, true);
+    }
+    for (name, level) in fit_indicators(indicators, room) {
         spans.push(Span::styled("●", Style::default().fg(level.colour(theme))));
         spans.push(Span::styled(format!(" {name}  "), theme.muted()));
     }
@@ -437,6 +439,35 @@ fn draw_header(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
         area,
     );
+}
+
+/// The indicators as drawn: `●`, a space, the label and two spaces each.
+fn indicators_width(indicators: &[(String, panes::Level)]) -> usize {
+    indicators
+        .iter()
+        .map(|(name, _)| name.chars().count() + 4)
+        .sum()
+}
+
+/// The indicators, with the user name in `apps (<user>)` cut to end in `…` as far as
+/// `room` columns need, down to one letter.
+fn fit_indicators(
+    mut indicators: [(String, panes::Level); 4],
+    room: usize,
+) -> [(String, panes::Level); 4] {
+    let over = indicators_width(&indicators).saturating_sub(room);
+    let apps = &mut indicators[3].0;
+    let Some(user) = apps
+        .strip_prefix("apps (")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return indicators;
+    };
+    let kept = user.chars().count().saturating_sub(over + 1).max(1);
+    if kept + 1 < user.chars().count() {
+        *apps = format!("apps ({}…)", user.chars().take(kept).collect::<String>());
+    }
+    indicators
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, theme: &Theme, view: &Overview<'_>) {
@@ -485,7 +516,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, theme: &Theme, view: &Overview
         // Before `?` and `q`, which close the list.
         hints.insert(hints.len() - 2, ("r", "scan"));
     }
-    // `t` is the first hint to go when the line is wider than the terminal.
+    // `t` names the theme while there is room, then is plain, then is the first hint to go.
     let width = |hints: &[(&str, &str)]| {
         1 + hints
             .iter()
@@ -493,7 +524,16 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, theme: &Theme, view: &Overview
             .sum::<usize>()
             + 3 * hints.len().saturating_sub(1)
     };
-    if width(&hints) > usize::from(area.width) {
+    let fits = |hints: &[(&str, &str)]| width(hints) <= usize::from(area.width);
+    let theme_hint = format!("theme ({})", view.theme_name);
+    if let Some(at) = hints.iter().position(|(key, _)| *key == "t") {
+        let plain = hints[at].1;
+        hints[at].1 = &theme_hint;
+        if !fits(&hints) {
+            hints[at].1 = plain;
+        }
+    }
+    if !fits(&hints) {
         hints.retain(|(key, _)| *key != "t");
     }
     let mut spans = vec![Span::raw(" ")];

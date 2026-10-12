@@ -78,7 +78,7 @@ pub(crate) fn run_within(
 
 fn read_in_background(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
-        // The thread that starts this one may have `cap_sys_ptrace` available.
+        // The thread that starts this one may still have capabilities available.
         or_stop(give_up_everything());
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {

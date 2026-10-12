@@ -6,6 +6,7 @@ use std::{
     collections::HashSet,
     net::IpAddr,
     ops::RangeInclusive,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,10 +18,11 @@ use std::{
 
 use crate::{
     attribution_log::{self, AttributionLog},
+    capture_source::own_user_name,
     collect::{
         attribution::{
-            AttributionCollector, AttributionHealth, AttributionResult, LinuxProcfsSource, NoOwner,
-            NoOwnerCause, OwnerMemory, ProcessIdentity,
+            AttributionCollector, AttributionHealth, AttributionResult, LinuxProcfsSource,
+            Listener, NoOwner, NoOwnerCause, OwnerMemory, ProcessIdentity,
         },
         capture::{
             CaptureHealth, CaptureOrigin, CaptureSource, CaptureWorker, PcapSource, Protocol,
@@ -36,10 +38,7 @@ use crate::{
     },
     config::Config,
     firewall::{self, FirewallEvent, FirewallProvider, FirewallStatus, RuleSnapshot},
-    privileges::{
-        Capabilities, PrivilegeError, enable_net_raw_if_available, give_up_everything,
-        keep_only_sys_ptrace_available, with_sys_ptrace,
-    },
+    privileges::{PrivilegeError, enable_net_raw_if_available, give_up_everything, is_root},
     state::{AppState, DEFAULT_EPHEMERAL_PORTS, left_out_of_app_traffic},
 };
 
@@ -232,11 +231,9 @@ impl LiveWorkers {
         config: &Config,
         sender: SyncSender<DashboardEvent>,
         attribution_log: Option<AttributionLog>,
-        capabilities: Option<Capabilities>,
         origin: CaptureOrigin,
     ) -> Self {
-        // Unknown capabilities show nothing; only a known missing one is limited.
-        let limited = capabilities.is_some_and(|c| !c.sys_ptrace);
+        let only_user = (!is_root()).then(own_user_name);
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
         let capture_sender = sender.clone();
@@ -249,8 +246,10 @@ impl LiveWorkers {
                         capture_sender,
                         capture_cancelled,
                         attribution_log,
-                        limited,
+                        only_user,
                         origin,
+                        open_capture,
+                        "/proc".into(),
                     )
                 })
                 .expect("capture worker thread creation failed"),
@@ -268,7 +267,6 @@ impl LiveWorkers {
                         interface_sender,
                         interface_cancelled,
                         metrics_scan_requested,
-                        limited,
                     )
                 })
                 .expect("metrics worker thread creation failed"),
@@ -281,7 +279,8 @@ impl LiveWorkers {
                 .name("crosswalk-firewall".to_owned())
                 .spawn(move || {
                     or_stop(give_up_everything());
-                    let mut provider = firewall::create_provider(&config);
+                    let mut provider =
+                        firewall::create_provider(&config, firewall_cancelled.clone());
                     firewall_loop(provider.as_mut(), sender, firewall_cancelled)
                 })
                 .expect("firewall worker thread creation failed"),
@@ -347,12 +346,25 @@ pub fn local_addresses(snapshot: &InterfaceSnapshot) -> Option<HashSet<IpAddr>> 
     })
 }
 
+fn degraded_capture_status(
+    error: String,
+    origin: CaptureOrigin,
+) -> crate::collect::capture::CaptureStatus {
+    crate::collect::capture::CaptureStatus {
+        health: CaptureHealth::Degraded(error),
+        dropped: 0,
+        origin,
+    }
+}
+
 fn capture_loop(
     sender: SyncSender<DashboardEvent>,
     cancelled: Arc<AtomicBool>,
     mut log: Option<AttributionLog>,
-    limited: bool,
+    only_user: Option<String>,
     origin: CaptureOrigin,
+    open: impl FnOnce(CaptureOrigin) -> Result<Box<dyn CaptureSource>, String>,
+    scan_root: PathBuf,
 ) {
     let (traffic_sender, traffic_receiver) = sync_channel(256);
     let mut interface_collector = InterfaceCounterCollector::new(LinuxInterfaceSource::new());
@@ -360,7 +372,7 @@ fn capture_loop(
     let addresses = local_addresses(&initial).unwrap_or_default();
     let _ = sender.try_send(DashboardEvent::Interfaces(initial));
     let mut attribution = match AttributionCollector::new(
-        LinuxProcfsSource::new("/proc"),
+        LinuxProcfsSource::new(scan_root),
         Duration::from_secs(3),
         65_536,
     ) {
@@ -369,52 +381,32 @@ fn capture_loop(
             let _ = sender.try_send(DashboardEvent::Attribution(
                 crate::collect::attribution::AttributionStatus {
                     health: AttributionHealth::Unavailable(error.to_string()),
-                    incomplete: true,
-                    limited,
+                    only_user: only_user.clone(),
                 },
             ));
             None
         }
     };
     or_stop(enable_net_raw_if_available());
-    let opened = open_capture(origin);
-    or_stop(keep_only_sys_ptrace_available());
-    let source = match opened {
-        Ok(source) => source,
+    let opened = open(origin);
+    or_stop(give_up_everything());
+    // With no worker the loop goes on scanning and there are simply no packets. The one
+    // degraded status stays pending until the queue takes it; nothing replaces it.
+    let mut pending_status = None;
+    let mut worker = match opened.and_then(|source| CaptureWorker::new(source, addresses, 128)) {
+        Ok(worker) => Some(worker),
         Err(error) => {
-            let _ = sender.try_send(DashboardEvent::CaptureStatus(
-                crate::collect::capture::CaptureStatus {
-                    health: CaptureHealth::Degraded(error),
-                    packets_read: 0,
-                    capture_received: 0,
-                    capture_dropped: 0,
-                    delivery_dropped: 0,
-                    origin,
-                },
-            ));
-            return;
-        }
-    };
-    let mut worker = match CaptureWorker::new(source, addresses, 128) {
-        Ok(worker) => worker,
-        Err(error) => {
-            let _ = sender.try_send(DashboardEvent::CaptureStatus(
-                crate::collect::capture::CaptureStatus {
-                    health: CaptureHealth::Degraded(error),
-                    packets_read: 0,
-                    capture_received: 0,
-                    capture_dropped: 0,
-                    delivery_dropped: 0,
-                    origin,
-                },
-            ));
-            return;
+            pending_status = Some(DashboardEvent::CaptureStatus(degraded_capture_status(
+                error, origin,
+            )));
+            None
         }
     };
     let start = Instant::now();
     let mut last_addresses = Duration::ZERO;
     let mut dropped = 0_u64;
     let mut hold = PacketHold::new(HELD_PACKET_LIMIT);
+    let mut listeners_queue = ListenersQueue::default();
     // TCP ports the latest snapshot shows listening, for the leave-out rule
     // and the log.
     let mut listening_tcp_ports: HashSet<u16> = HashSet::new();
@@ -448,15 +440,17 @@ fn capture_loop(
         // Not sent to the dashboard: `metrics_loop` sends its own readings.
         if now.saturating_sub(last_addresses) >= ADDRESSES_EVERY {
             last_addresses = now;
-            if let Some(addresses) = local_addresses(&interface_collector.sample(now)) {
+            if let Some(worker) = worker.as_mut()
+                && let Some(addresses) = local_addresses(&interface_collector.sample(now))
+            {
                 worker.set_local_addresses(addresses);
             }
         }
         if hold.snapshot_due(now) {
             let mut released = Vec::new();
             if let Some(attribution) = attribution.as_mut() {
-                let mut status = scan_proc(|| attribution.refresh(now));
-                status.limited = limited;
+                let mut status = attribution.refresh(now);
+                status.only_user = only_user.clone();
                 let available = status.health == AttributionHealth::Available;
                 let _ = sender.try_send(DashboardEvent::Attribution(status));
                 if let Some(stats) = attribution.snapshot_stats()
@@ -464,13 +458,14 @@ fn capture_loop(
                 {
                     log.write(&attribution_log::snapshot_line(now, &stats));
                 }
-                listening_tcp_ports = attribution
-                    .listeners()
-                    .unwrap_or_default()
+                let listeners = attribution.listeners();
+                listening_tcp_ports = listeners
                     .iter()
+                    .flatten()
                     .filter(|listener| listener.protocol == Protocol::Tcp)
                     .map(|listener| listener.port)
                     .collect();
+                listeners_queue.build_if_due(now, listeners);
                 released = if available {
                     hold.release(now, |event| attribution.attribute(event, now).owner)
                 } else {
@@ -493,7 +488,14 @@ fn capture_loop(
                 }
             }
         }
-        let status = worker.poll(&traffic_sender, &cancelled);
+        if !send_pending(&sender, &mut listeners_queue.pending)
+            || !send_pending(&sender, &mut pending_status)
+        {
+            return;
+        }
+        let status = worker
+            .as_mut()
+            .map(|worker| worker.poll(&traffic_sender, &cancelled));
         while let Ok(event) = traffic_receiver.try_recv() {
             let (event, process) = match attribution.as_ref() {
                 Some(attribution) => {
@@ -521,10 +523,41 @@ fn capture_loop(
                 return;
             }
         }
-        let mut status = status;
-        status.delivery_dropped = status.delivery_dropped.saturating_add(dropped);
-        let _ = sender.try_send(DashboardEvent::CaptureStatus(status));
+        if let Some(mut status) = status {
+            status.dropped = status.dropped.saturating_add(dropped);
+            // The loop's own drops stay owed until a status carrying them is taken.
+            if sender
+                .try_send(DashboardEvent::CaptureStatus(status))
+                .is_ok()
+            {
+                dropped = 0;
+            }
+        }
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The listeners event on its way to the dashboard: built when `LISTENERS_EVERY` has
+/// passed since the last build and none is still waiting, kept until the queue takes it.
+#[derive(Default)]
+struct ListenersQueue {
+    last_built: Option<Duration>,
+    pending: Option<DashboardEvent>,
+}
+
+impl ListenersQueue {
+    /// `listeners` is the scan's reading, absent until a scan has succeeded.
+    fn build_if_due(&mut self, now: Duration, listeners: Option<Vec<Listener>>) {
+        let due = self
+            .last_built
+            .is_none_or(|last| now.saturating_sub(last) >= LISTENERS_EVERY);
+        if let (true, true, Some(listeners)) = (self.pending.is_none(), due, listeners) {
+            self.last_built = Some(now);
+            self.pending = Some(DashboardEvent::Listeners {
+                listeners,
+                ephemeral: ephemeral_port_range(),
+            });
+        }
     }
 }
 
@@ -559,19 +592,10 @@ fn metrics_loop(
     sender: SyncSender<DashboardEvent>,
     cancelled: Arc<AtomicBool>,
     scan_requested: Arc<AtomicBool>,
-    limited: bool,
 ) {
-    or_stop(keep_only_sys_ptrace_available());
+    or_stop(give_up_everything());
     let mut collector = InterfaceCounterCollector::new(LinuxInterfaceSource::new());
     let start = Instant::now();
-    let mut attribution = AttributionCollector::new(
-        LinuxProcfsSource::new("/proc"),
-        Duration::from_secs(3),
-        65_536,
-    )
-    .ok();
-    let mut last_listeners: Option<Duration> = None;
-    let mut pending_listeners: Option<DashboardEvent> = None;
     let mut neighbors = NeighborCollector::new(IpCommand::new(Arc::clone(&cancelled)));
     let mut last_neighbors: Option<Duration> = None;
     let mut pending_neighbors: Option<DashboardEvent> = None;
@@ -583,21 +607,6 @@ fn metrics_loop(
     while !cancelled.load(Ordering::Acquire) {
         let now = start.elapsed();
         let _ = sender.try_send(DashboardEvent::Interfaces(collector.sample(now)));
-        if let Some(collector) = attribution.as_mut() {
-            let mut status = scan_proc(|| collector.refresh(now));
-            status.limited = limited;
-            let _ = sender.try_send(DashboardEvent::Attribution(status));
-            if pending_listeners.is_none()
-                && last_listeners.is_none_or(|last| now.saturating_sub(last) >= LISTENERS_EVERY)
-                && let Some(listeners) = collector.listeners()
-            {
-                last_listeners = Some(now);
-                pending_listeners = Some(DashboardEvent::Listeners {
-                    listeners,
-                    ephemeral: ephemeral_port_range(),
-                });
-            }
-        }
         if pending_neighbors.is_none()
             && last_neighbors.is_none_or(|last| now.saturating_sub(last) >= LISTENERS_EVERY)
         {
@@ -622,19 +631,25 @@ fn metrics_loop(
             pending_scan = Some(DashboardEvent::WifiScan(outcome));
         }
         send_pending(&sender, &mut pending_scan);
-        send_pending(&sender, &mut pending_listeners);
         send_pending(&sender, &mut pending_neighbors);
         send_pending(&sender, &mut pending_wifi);
         sleep_cancelled(Duration::from_secs(1), &cancelled);
     }
 }
 
-/// Sends a held event; a full queue keeps it for the next loop pass.
-fn send_pending(sender: &SyncSender<DashboardEvent>, pending: &mut Option<DashboardEvent>) {
-    if let Some(event) = pending.take()
-        && let Err(TrySendError::Full(event)) = sender.try_send(event)
-    {
-        *pending = Some(event);
+/// Sends a held event; a full queue keeps it for the next loop pass. False when the
+/// dashboard is gone.
+fn send_pending(sender: &SyncSender<DashboardEvent>, pending: &mut Option<DashboardEvent>) -> bool {
+    let Some(event) = pending.take() else {
+        return true;
+    };
+    match sender.try_send(event) {
+        Err(TrySendError::Full(event)) => {
+            *pending = Some(event);
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+        Ok(()) => true,
     }
 }
 
@@ -645,7 +660,6 @@ fn firewall_loop(
 ) {
     let (event_sender, event_receiver) = sync_channel(256);
     let start = Instant::now();
-    let mut dropped = 0_u64;
     let mut last_rules: Option<Instant> = None;
     let mut pending_rules: Option<DashboardEvent> = None;
     loop {
@@ -661,18 +675,11 @@ fn firewall_loop(
         }
         let status = provider.poll(&event_sender, &cancelled);
         while let Ok(event) = event_receiver.try_recv() {
-            if sender
-                .try_send(DashboardEvent::Firewall {
-                    at: start.elapsed(),
-                    event,
-                })
-                .is_err()
-            {
-                dropped = dropped.saturating_add(1);
-            }
+            let _ = sender.try_send(DashboardEvent::Firewall {
+                at: start.elapsed(),
+                event,
+            });
         }
-        let mut status = status;
-        status.delivery_dropped = status.delivery_dropped.saturating_add(dropped);
         let _ = sender.try_send(DashboardEvent::FirewallStatus(status));
         if cancelled.load(Ordering::Acquire) {
             break;
@@ -717,11 +724,6 @@ pub(crate) fn or_stop(result: Result<(), PrivilegeError>) {
     if let Err(error) = result {
         stop_for_privilege_failure(error);
     }
-}
-
-/// Runs a scan of `/proc` with `cap_sys_ptrace` in effect for its length only.
-fn scan_proc<T>(scan: impl FnOnce() -> T) -> T {
-    with_sys_ptrace(scan).unwrap_or_else(|error| stop_for_privilege_failure(error))
 }
 
 fn sleep_cancelled(duration: Duration, cancelled: &AtomicBool) {
@@ -774,11 +776,8 @@ mod tests {
 
         fn status(&self) -> FirewallStatus {
             FirewallStatus {
+                name: "ufw",
                 health: FirewallHealth::Available,
-                records_read: 0,
-                events_emitted: 0,
-                malformed_records: 0,
-                delivery_dropped: 0,
             }
         }
     }
@@ -808,5 +807,384 @@ mod tests {
         drop(receiver);
         worker.join().unwrap();
         assert!(seen_rules, "rules were not retried after the queue freed");
+    }
+
+    struct IdleCapture;
+
+    impl CaptureSource for IdleCapture {
+        fn link_type(&self) -> i32 {
+            276
+        }
+
+        fn next_packet(&mut self) -> Result<crate::collect::capture::PacketRead, String> {
+            Ok(crate::collect::capture::PacketRead::Idle)
+        }
+
+        fn statistics(&mut self) -> Result<crate::collect::capture::CaptureStatistics, String> {
+            Ok(crate::collect::capture::CaptureStatistics::default())
+        }
+    }
+
+    /// A capture that hands over a few packets and then fails, as a stopped `dumpcap` does.
+    struct FailingCapture {
+        packets_left: u32,
+    }
+
+    impl CaptureSource for FailingCapture {
+        fn link_type(&self) -> i32 {
+            276
+        }
+
+        fn next_packet(&mut self) -> Result<crate::collect::capture::PacketRead, String> {
+            if self.packets_left == 0 {
+                return Err("capture stream ended".to_owned());
+            }
+            self.packets_left -= 1;
+            Ok(crate::collect::capture::PacketRead::Packet {
+                data: vec![0; 8],
+                captured_at: None,
+            })
+        }
+
+        fn statistics(&mut self) -> Result<crate::collect::capture::CaptureStatistics, String> {
+            Ok(crate::collect::capture::CaptureStatistics::default())
+        }
+    }
+
+    type Opener = Box<dyn FnOnce(CaptureOrigin) -> Result<Box<dyn CaptureSource>, String> + Send>;
+
+    fn opening(source: impl CaptureSource + Send + 'static) -> Opener {
+        Box::new(|_| Ok(Box::new(source) as Box<dyn CaptureSource>))
+    }
+
+    /// A directory laid out like `/proc` with one TCP socket listening on port 8080.
+    struct ScanRoot(PathBuf);
+
+    impl ScanRoot {
+        fn with_a_listener(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("crosswalk-runtime-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("self/ns")).unwrap();
+            std::os::unix::fs::symlink("net:[7]", root.join("self/ns/net")).unwrap();
+            std::fs::create_dir_all(root.join("net")).unwrap();
+            for table in ["tcp", "tcp6", "udp", "udp6"] {
+                std::fs::write(root.join("net").join(table), "header\n").unwrap();
+            }
+            std::fs::write(
+                root.join("net/tcp"),
+                "header\n0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 201",
+            )
+            .unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for ScanRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The real capture loop on a thread, with an idle capture and a scan root
+    /// holding one listener, sending into a queue of the given size.
+    struct RunningCapture {
+        receiver: Receiver<DashboardEvent>,
+        cancelled: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+        started: Instant,
+        _root: ScanRoot,
+    }
+
+    impl RunningCapture {
+        fn start(name: &str, queue: usize) -> Self {
+            let root = ScanRoot::with_a_listener(name);
+            let (sender, receiver) = sync_channel(queue);
+            Self::start_with(root, sender, receiver)
+        }
+
+        fn start_with(
+            root: ScanRoot,
+            sender: SyncSender<DashboardEvent>,
+            receiver: Receiver<DashboardEvent>,
+        ) -> Self {
+            Self::start_opening(root, sender, receiver, opening(IdleCapture))
+        }
+
+        fn start_opening(
+            root: ScanRoot,
+            sender: SyncSender<DashboardEvent>,
+            receiver: Receiver<DashboardEvent>,
+            open: Opener,
+        ) -> Self {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker_cancelled = cancelled.clone();
+            let scan_root = root.0.clone();
+            let started = Instant::now();
+            let worker = thread::spawn(move || {
+                capture_loop(
+                    sender,
+                    worker_cancelled,
+                    None,
+                    None,
+                    CaptureOrigin::Own,
+                    open,
+                    scan_root,
+                );
+            });
+            Self {
+                receiver,
+                cancelled,
+                worker: Some(worker),
+                started,
+                _root: root,
+            }
+        }
+
+        fn start_opening_in_a_queue_of(name: &str, queue: usize, open: Opener) -> Self {
+            let (sender, receiver) = sync_channel(queue);
+            Self::start_opening(ScanRoot::with_a_listener(name), sender, receiver, open)
+        }
+
+        /// Every event that arrives before `until` after the start.
+        fn events_by(&self, until: Duration) -> Vec<DashboardEvent> {
+            let mut events = Vec::new();
+            while let Some(left) = until.checked_sub(self.started.elapsed()) {
+                if let Ok(event) = self.receiver.recv_timeout(left) {
+                    events.push(event);
+                }
+            }
+            events
+        }
+
+        /// The dashboard goes away: the receiver is dropped.
+        fn close_the_dashboard(&mut self) {
+            self.receiver = sync_channel(1).1;
+        }
+
+        /// Whether the loop returns within `limit`.
+        fn ends_within(&self, limit: Duration) -> bool {
+            let until = Instant::now() + limit;
+            let worker = self.worker.as_ref().unwrap();
+            while !worker.is_finished() && Instant::now() < until {
+                thread::sleep(Duration::from_millis(10));
+            }
+            worker.is_finished()
+        }
+
+        /// The next listeners event that arrives before `until` after the start.
+        fn listeners_by(&self, until: Duration) -> Option<(Duration, DashboardEvent)> {
+            loop {
+                let left = until.checked_sub(self.started.elapsed())?;
+                match self.receiver.recv_timeout(left) {
+                    Ok(event @ DashboardEvent::Listeners { .. }) => {
+                        return Some((self.started.elapsed(), event));
+                    }
+                    Ok(_) => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+
+    impl Drop for RunningCapture {
+        fn drop(&mut self) {
+            self.cancelled.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                // Keep the queue draining so a send never blocks the join.
+                while !worker.is_finished() {
+                    let _ = self.receiver.try_recv();
+                    thread::sleep(Duration::from_millis(5));
+                }
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn the_capture_thread_publishes_the_listening_ports_at_once() {
+        let capture = RunningCapture::start("first", 1024);
+        let (_, event) = capture
+            .listeners_by(Duration::from_secs(1))
+            .expect("no listeners event within a second");
+        let DashboardEvent::Listeners {
+            listeners,
+            ephemeral,
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].port, 8080);
+        assert_eq!(listeners[0].protocol, Protocol::Tcp);
+        assert!(ephemeral.start() <= ephemeral.end());
+    }
+
+    #[test]
+    fn the_listening_ports_come_again_no_sooner_than_every_two_seconds() {
+        let capture = RunningCapture::start("again", 1024);
+        let (first, _) = capture
+            .listeners_by(Duration::from_secs(1))
+            .expect("no first listeners event");
+        let (second, _) = capture
+            .listeners_by(Duration::from_secs(6))
+            .expect("no second listeners event");
+        let between = second - first;
+        assert!(
+            between >= LISTENERS_EVERY,
+            "second listeners event only {between:?} after the first"
+        );
+    }
+
+    #[test]
+    fn listening_ports_dropped_by_a_full_queue_are_sent_once_there_is_room() {
+        let root = ScanRoot::with_a_listener("full");
+        let (sender, receiver) = sync_channel(1);
+        sender
+            .send(DashboardEvent::WifiScan(ScanOutcome::Accepted))
+            .unwrap();
+        let capture = RunningCapture::start_with(root, sender, receiver);
+        // The first listeners event is built and refused at once; the next
+        // would not be built until two seconds in.
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            capture.listeners_by(Duration::from_millis(1500)).is_some(),
+            "the held listeners event was not sent once the queue had room"
+        );
+    }
+
+    /// What a loop with no working capture sends in `until`: the degraded capture
+    /// status once, and the scan's app status and listening ports as they fall due.
+    fn assert_scanning_goes_on(name: &str, open: Opener) {
+        let capture = RunningCapture::start_opening_in_a_queue_of(name, 1024, open);
+        let events = capture.events_by(Duration::from_millis(3500));
+        let statuses: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                DashboardEvent::CaptureStatus(status) => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses.len(), 1, "capture statuses sent");
+        assert!(matches!(statuses[0].health, CaptureHealth::Degraded(_)));
+        let count =
+            |wanted: fn(&DashboardEvent) -> bool| events.iter().filter(|e| wanted(e)).count();
+        let app_statuses = count(|event| matches!(event, DashboardEvent::Attribution(_)));
+        let listeners = count(|event| matches!(event, DashboardEvent::Listeners { .. }));
+        assert!(app_statuses >= 3, "app statuses in 3.5 s: {app_statuses}");
+        assert!(listeners >= 2, "listeners events in 3.5 s: {listeners}");
+    }
+
+    #[test]
+    fn scanning_goes_on_when_the_capture_cannot_be_opened() {
+        assert_scanning_goes_on("unopened", Box::new(|_| Err("no dumpcap".to_owned())));
+    }
+
+    #[test]
+    fn scanning_goes_on_when_the_worker_refuses_the_link_type() {
+        struct OtherLink;
+        impl CaptureSource for OtherLink {
+            fn link_type(&self) -> i32 {
+                1
+            }
+
+            fn next_packet(&mut self) -> Result<crate::collect::capture::PacketRead, String> {
+                Ok(crate::collect::capture::PacketRead::Idle)
+            }
+
+            fn statistics(&mut self) -> Result<crate::collect::capture::CaptureStatistics, String> {
+                Ok(crate::collect::capture::CaptureStatistics::default())
+            }
+        }
+        assert_scanning_goes_on("refused", opening(OtherLink));
+    }
+
+    #[test]
+    fn listening_ports_keep_coming_after_the_capture_fails_midway() {
+        let capture = RunningCapture::start_opening_in_a_queue_of(
+            "midway",
+            1024,
+            opening(FailingCapture { packets_left: 3 }),
+        );
+        let listeners = capture
+            .events_by(Duration::from_millis(3500))
+            .iter()
+            .filter(|event| matches!(event, DashboardEvent::Listeners { .. }))
+            .count();
+        assert!(listeners >= 2, "listeners events in 3.5 s: {listeners}");
+    }
+
+    /// `packets` loopback UDP packets, then nothing more to read.
+    struct LoopbackPackets {
+        packets: usize,
+    }
+
+    impl CaptureSource for LoopbackPackets {
+        fn link_type(&self) -> i32 {
+            276
+        }
+
+        fn next_packet(&mut self) -> Result<crate::collect::capture::PacketRead, String> {
+            use crate::collect::capture::PacketRead;
+            if self.packets == 0 {
+                return Ok(PacketRead::Idle);
+            }
+            self.packets -= 1;
+            let mut data = vec![0_u8; 20 + 20 + 8];
+            data[0..2].copy_from_slice(&0x0800_u16.to_be_bytes());
+            data[10] = 4;
+            let ip = &mut data[20..];
+            ip[0] = 0x45;
+            ip[2..4].copy_from_slice(&28_u16.to_be_bytes());
+            ip[8] = 64;
+            ip[9] = 17;
+            ip[12..16].copy_from_slice(&[127, 0, 0, 1]);
+            ip[16..20].copy_from_slice(&[127, 0, 0, 1]);
+            ip[20..22].copy_from_slice(&5000_u16.to_be_bytes());
+            ip[22..24].copy_from_slice(&5001_u16.to_be_bytes());
+            Ok(PacketRead::Packet {
+                data,
+                captured_at: None,
+            })
+        }
+
+        fn statistics(&mut self) -> Result<crate::collect::capture::CaptureStatistics, String> {
+            Ok(crate::collect::capture::CaptureStatistics::default())
+        }
+    }
+
+    #[test]
+    fn traffic_dropped_on_a_full_dashboard_queue_is_reported_once_the_queue_has_room() {
+        let packets = 5;
+        let (sender, receiver) = sync_channel(1);
+        let capture = RunningCapture::start_opening(
+            ScanRoot::with_a_listener("dashboard-full"),
+            sender,
+            receiver,
+            opening(LoopbackPackets { packets }),
+        );
+        thread::sleep(Duration::from_millis(1500));
+        let reported: u64 = capture
+            .events_by(Duration::from_millis(2500))
+            .iter()
+            .filter_map(|event| match event {
+                DashboardEvent::CaptureStatus(status) => Some(status.dropped),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(reported, packets as u64);
+    }
+
+    #[test]
+    fn the_loop_ends_when_the_dashboard_is_gone_with_or_without_a_capture() {
+        let failing: Opener = Box::new(|_| Err("no dumpcap".to_owned()));
+        for open in [failing, opening(IdleCapture)] {
+            let mut capture = RunningCapture::start_opening_in_a_queue_of("gone", 1024, open);
+            capture.close_the_dashboard();
+            assert!(
+                capture.ends_within(Duration::from_secs(3)),
+                "the loop kept running with no dashboard"
+            );
+        }
     }
 }

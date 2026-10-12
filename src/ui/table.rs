@@ -27,6 +27,8 @@ pub struct Column {
     pub least_width: Option<u16>,
     /// When a cell is cut to fit, cut it from the left, so the end shows.
     pub cut_left: bool,
+    /// When a cell is cut to fit, cut it from the middle, so both ends show.
+    pub cut_middle: bool,
     /// Blank cells before the column, beyond the one every column has.
     pub lead: u16,
 }
@@ -42,6 +44,7 @@ impl Column {
             max_width: None,
             least_width: None,
             cut_left: false,
+            cut_middle: false,
             lead: 0,
         }
     }
@@ -50,6 +53,12 @@ impl Column {
     /// Its `min_width` is the least it is given.
     pub fn fill(mut self, order: u8) -> Self {
         self.fill = Some(order);
+        self
+    }
+
+    /// Cuts a cell that does not fit from the middle, `…` between its two ends.
+    pub fn cut_from_middle(mut self) -> Self {
+        self.cut_middle = true;
         self
     }
 
@@ -372,6 +381,8 @@ impl<'a> Table<'a> {
             let (text, own, glyphs) = cell(i);
             let text = if self.columns[i].cut_left {
                 cut_left(text, w as u16)
+            } else if self.columns[i].cut_middle {
+                cut_middle(text, w)
             } else {
                 fit(text, w)
             };
@@ -398,6 +409,22 @@ pub(super) fn fit(text: &str, width: usize) -> String {
     } else {
         text.chars().take(width - 1).chain(['…']).collect()
     }
+}
+
+/// The text cut in the middle to `width` cells, `…` between the start and the end.
+pub fn cut_middle(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width || width == 0 {
+        return fit(text, width);
+    }
+    let kept = width - 1;
+    let tail = kept / 2;
+    let head = kept - tail;
+    text.chars()
+        .take(head)
+        .chain(['…'])
+        .chain(text.chars().skip(count - tail))
+        .collect()
 }
 
 /// The text cut from the left to `width` cells, `…` first, so the end of a

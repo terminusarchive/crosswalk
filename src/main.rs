@@ -30,7 +30,7 @@ fn main() {
         Err(error) => error.exit(),
     };
     let origin = capture_origin(capabilities);
-    if let Err(error) = run(config, capabilities, origin) {
+    if let Err(error) = run(config, origin) {
         eprintln!("crosswalk: {error}");
         std::process::exit(1);
     }
@@ -59,11 +59,7 @@ fn capture_origin(capabilities: Option<Capabilities>) -> CaptureOrigin {
     }
 }
 
-fn run(
-    config: Config,
-    capabilities: Option<Capabilities>,
-    origin: CaptureOrigin,
-) -> io::Result<()> {
+fn run(config: Config, origin: CaptureOrigin) -> io::Result<()> {
     let attribution_log = config
         .attribution_log
         .as_deref()
@@ -76,7 +72,7 @@ fn run(
     let mut interaction = Interaction::with_names(config.reverse_dns)
         .with_theme(config.theme_name, &config.theme_overrides);
     let (sender, mut pump) = event_channel();
-    let mut workers = LiveWorkers::start(&config, sender, attribution_log, capabilities, origin);
+    let mut workers = LiveWorkers::start(&config, sender, attribution_log, origin);
     give_up_everything().map_err(io::Error::other)?;
     let mut dns = ReverseDns::default();
     dns.set_enabled(config.reverse_dns);

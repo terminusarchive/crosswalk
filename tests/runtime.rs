@@ -89,7 +89,6 @@ fn fixture_workers_feed_all_four_real_renderers_and_source_failures_are_independ
     let mut capture =
         CaptureWorker::new(FixtureCapture(Some(packet)), HashSet::from([local]), 8).unwrap();
     let status = capture.poll(&sender, &AtomicBool::new(false));
-    assert_eq!(status.packets_read, 1);
 
     let (events_sender, events_receiver) = sync_channel(4);
     events_sender
@@ -182,31 +181,20 @@ fn capture_queue_loss_reaches_application_state_and_frame_work_is_bounded() {
     .unwrap();
     let (traffic_sender, _traffic_receiver) = sync_channel(1);
     let status = worker.poll(&traffic_sender, &AtomicBool::new(false));
-    assert_eq!(status.delivery_dropped, 1);
+    assert_eq!(status.dropped, 1);
 
     let (sender, receiver) = sync_channel(8);
     sender.send(DashboardEvent::CaptureStatus(status)).unwrap();
     sender
         .send(DashboardEvent::FirewallStatus(FirewallStatus {
+            name: "ufw",
             health: FirewallHealth::Available,
-            records_read: 0,
-            events_emitted: 0,
-            malformed_records: 0,
-            delivery_dropped: 0,
         }))
         .unwrap();
     let mut pump = EventPump::new(receiver);
     let mut state = AppState::new(StateLimits::default()).unwrap();
     assert_eq!(pump.drain(&mut state, 1), 1);
-    assert_eq!(
-        state
-            .source_health()
-            .capture
-            .as_ref()
-            .unwrap()
-            .delivery_dropped,
-        1
-    );
+    assert_eq!(state.source_health().capture.as_ref().unwrap().dropped, 1);
     assert_eq!(pump.drain(&mut state, 1), 1);
 }
 
@@ -516,11 +504,7 @@ mod hold {
     }
 
     fn result(owner: Option<ProcessIdentity>, health: AttributionHealth) -> AttributionResult {
-        AttributionResult {
-            owner,
-            health,
-            incomplete: false,
-        }
+        AttributionResult { owner, health }
     }
 
     fn unowned() -> AttributionResult {
@@ -678,20 +662,20 @@ mod hold {
 }
 
 #[test]
-fn the_pump_delivers_the_limited_attribution_mark_to_the_state() {
+fn the_pump_delivers_the_attribution_users_name_to_the_state() {
     use crosswalk::collect::attribution::{AttributionHealth, AttributionStatus};
     let (sender, receiver) = sync_channel(4);
     sender
         .send(DashboardEvent::Attribution(AttributionStatus {
             health: AttributionHealth::Available,
-            incomplete: false,
-            limited: true,
+            only_user: Some("alice".to_owned()),
         }))
         .unwrap();
     let mut state = AppState::new(StateLimits::default()).unwrap();
     let mut pump = EventPump::new(receiver);
     assert_eq!(pump.drain(&mut state, 16), 1);
-    assert!(state.source_health().attribution.as_ref().unwrap().limited);
+    let status = state.source_health().attribution.as_ref().unwrap().clone();
+    assert_eq!(status.only_user.as_deref(), Some("alice"));
 }
 
 #[test]
@@ -740,6 +724,7 @@ fn interface_snapshot(
             session_received_bytes: 0,
             session_transmitted_bytes: 0,
             status: InterfaceStatus::Available,
+            is_up: true,
         }],
         default_route: None,
         gateway: None,

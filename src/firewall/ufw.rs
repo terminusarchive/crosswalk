@@ -4,6 +4,7 @@ use std::{
     io::{self, BufRead, BufReader, Seek, SeekFrom},
     mem,
     net::IpAddr,
+    ops::ControlFlow,
     os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Stdio},
@@ -16,9 +17,9 @@ use std::{
 use serde_json::Value;
 
 use super::{
-    FirewallEndpoint, FirewallEvent, FirewallHealth, FirewallOutcome, FirewallProvider,
-    FirewallStatus, Network, Policy, Rule, RuleAction, RuleDirection, RuleSnapshot, RuleSource,
-    input_for_source, unavailable,
+    FirewallEndpoint, FirewallEvent, FirewallHealth, FirewallProvider, FirewallStatus, Network,
+    Policy, Rule, RuleAction, RuleDirection, RuleSnapshot, RuleSource, input_for_source,
+    unavailable,
 };
 use crate::{
     collect::capture::{Direction, Protocol},
@@ -26,8 +27,9 @@ use crate::{
     config::UfwSource,
 };
 
-const DEFAULT_RECORD_LIMIT: usize = 64;
-const DEFAULT_RECORD_BYTES: usize = 16 * 1024;
+const UFW_MARKER: &str = "[UFW BLOCK]";
+pub(super) const DEFAULT_RECORD_LIMIT: usize = 64;
+pub(super) const DEFAULT_RECORD_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputRead {
@@ -51,11 +53,28 @@ impl<T: FirewallInput + ?Sized> FirewallInput for Box<T> {
 }
 
 pub struct UfwProvider<I> {
-    input: I,
+    reader: BlockReader<I>,
     status: FirewallStatus,
+    rule_source: Option<RuleFiles>,
+}
+
+/// What marks a denied packet in the kernel's log: each firewall words it differently, and
+/// the fields after it (`IN= OUT= SRC= DST= SPT= DPT= PROTO=`) are the kernel's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockMarker {
+    /// `[UFW BLOCK]` anywhere in the message.
+    Ufw,
+    /// firewalld's `filter_IN_<zone>_REJECT: ` or `filter_IN_<zone>_DROP: ` at the start of
+    /// the message.
+    Firewalld,
+}
+
+/// Reads denied packets from a log into events, and says how the reading is going.
+pub struct BlockReader<I> {
+    input: I,
+    marker: BlockMarker,
     record_limit: usize,
     record_bytes: usize,
-    rule_source: Option<RuleFiles>,
 }
 
 struct RuleFiles {
@@ -65,7 +84,7 @@ struct RuleFiles {
     user6_rules: PathBuf,
 }
 
-const UFW_CONF: &str = "/etc/ufw/ufw.conf";
+pub(super) const UFW_CONF: &str = "/etc/ufw/ufw.conf";
 const UFW_DEFAULTS: &str = "/etc/default/ufw";
 const USER_RULES: &str = "/etc/ufw/user.rules";
 const USER6_RULES: &str = "/etc/ufw/user6.rules";
@@ -95,6 +114,24 @@ impl<I: FirewallInput> UfwProvider<I> {
         record_limit: usize,
         record_bytes: usize,
     ) -> io::Result<Self> {
+        Ok(Self {
+            reader: BlockReader::new(input, BlockMarker::Ufw, record_limit, record_bytes)?,
+            status: FirewallStatus {
+                name: "ufw",
+                health,
+            },
+            rule_source: None,
+        })
+    }
+}
+
+impl<I: FirewallInput> BlockReader<I> {
+    pub fn new(
+        input: I,
+        marker: BlockMarker,
+        record_limit: usize,
+        record_bytes: usize,
+    ) -> io::Result<Self> {
         if record_limit == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -109,17 +146,102 @@ impl<I: FirewallInput> UfwProvider<I> {
         }
         Ok(Self {
             input,
-            status: FirewallStatus {
-                health,
-                records_read: 0,
-                events_emitted: 0,
-                malformed_records: 0,
-                delivery_dropped: 0,
-            },
+            marker,
             record_limit,
             record_bytes,
-            rule_source: None,
         })
+    }
+
+    /// Reads up to the record limit, sending each block to `sender` and moving `health` as the
+    /// reading goes. `Break` when `cancelled` was set before the reading was done.
+    pub fn read_into_health(
+        &mut self,
+        sender: &SyncSender<FirewallEvent>,
+        cancelled: &AtomicBool,
+        health: &mut FirewallHealth,
+    ) -> ControlFlow<()> {
+        for _ in 0..self.record_limit {
+            if cancelled.load(Ordering::Relaxed) {
+                return ControlFlow::Break(());
+            }
+            if self.read_one(sender, health).is_break() {
+                break;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    pub fn shutdown(&mut self) -> io::Result<()> {
+        self.input.shutdown()
+    }
+
+    /// Handles the next record. `Break` when there is nothing more to read now, or the reading
+    /// went wrong, or the receiver is gone.
+    fn read_one(
+        &mut self,
+        sender: &SyncSender<FirewallEvent>,
+        health: &mut FirewallHealth,
+    ) -> ControlFlow<()> {
+        match self.input.next_record() {
+            Ok(InputRead::Idle) => ControlFlow::Break(()),
+            Ok(InputRead::Record(record)) => self.take_record(&record, sender, health),
+            Err(error) => {
+                *health = FirewallHealth::Degraded(format!(
+                    "could not read {} input: {error}",
+                    self.marker.label()
+                ));
+                ControlFlow::Break(())
+            }
+        }
+    }
+
+    /// `Break` when the receiver is gone.
+    fn take_record(
+        &self,
+        record: &str,
+        sender: &SyncSender<FirewallEvent>,
+        health: &mut FirewallHealth,
+    ) -> ControlFlow<()> {
+        let label = self.marker.label();
+        if record.len() > self.record_bytes {
+            *health = FirewallHealth::Degraded(format!(
+                "{label} record exceeded the configured size limit"
+            ));
+            return ControlFlow::Continue(());
+        }
+        match normalize_record(record, self.marker) {
+            Ok(Some(event)) => deliver(event, sender, health),
+            Ok(None) => ControlFlow::Continue(()),
+            Err(error) => {
+                *health = FirewallHealth::Degraded(error);
+                ControlFlow::Continue(())
+            }
+        }
+    }
+}
+
+fn deliver(
+    event: FirewallEvent,
+    sender: &SyncSender<FirewallEvent>,
+    health: &mut FirewallHealth,
+) -> ControlFlow<()> {
+    match sender.try_send(event) {
+        Ok(()) => {
+            if matches!(
+                health,
+                FirewallHealth::AwaitingEvents
+                    | FirewallHealth::Available
+                    | FirewallHealth::DependsOnLogging
+            ) {
+                *health = FirewallHealth::Available;
+            }
+            ControlFlow::Continue(())
+        }
+        Err(TrySendError::Full(_)) => ControlFlow::Continue(()),
+        Err(TrySendError::Disconnected(_)) => {
+            *health = FirewallHealth::Degraded("firewall event receiver disconnected".to_owned());
+            ControlFlow::Break(())
+        }
     }
 }
 
@@ -130,7 +252,7 @@ impl<I: FirewallInput> FirewallProvider for UfwProvider<I> {
         cancelled: &AtomicBool,
     ) -> FirewallStatus {
         if cancelled.load(Ordering::Relaxed) {
-            self.status.health = match self.input.shutdown() {
+            self.status.health = match self.reader.shutdown() {
                 Ok(()) => FirewallHealth::Cancelled,
                 Err(error) => FirewallHealth::Degraded(format!(
                     "could not stop firewall input cleanly: {error}"
@@ -148,51 +270,12 @@ impl<I: FirewallInput> FirewallProvider for UfwProvider<I> {
             return self.status();
         }
 
-        for _ in 0..self.record_limit {
-            if cancelled.load(Ordering::Relaxed) {
-                return self.poll(sender, cancelled);
-            }
-            match self.input.next_record() {
-                Ok(InputRead::Idle) => break,
-                Ok(InputRead::Record(record)) => {
-                    self.status.records_read = self.status.records_read.saturating_add(1);
-                    if record.len() > self.record_bytes {
-                        self.malformed("UFW record exceeded the configured size limit");
-                        continue;
-                    }
-                    match normalize_record(&record) {
-                        Ok(Some(event)) => match sender.try_send(event) {
-                            Ok(()) => {
-                                self.status.events_emitted =
-                                    self.status.events_emitted.saturating_add(1);
-                                if matches!(
-                                    self.status.health,
-                                    FirewallHealth::AwaitingEvents | FirewallHealth::Available
-                                ) {
-                                    self.status.health = FirewallHealth::Available;
-                                }
-                            }
-                            Err(TrySendError::Full(_)) => {
-                                self.status.delivery_dropped =
-                                    self.status.delivery_dropped.saturating_add(1);
-                            }
-                            Err(TrySendError::Disconnected(_)) => {
-                                self.status.health = FirewallHealth::Degraded(
-                                    "firewall event receiver disconnected".to_owned(),
-                                );
-                                break;
-                            }
-                        },
-                        Ok(None) => {}
-                        Err(error) => self.malformed(error),
-                    }
-                }
-                Err(error) => {
-                    self.status.health =
-                        FirewallHealth::Degraded(format!("could not read UFW input: {error}"));
-                    break;
-                }
-            }
+        if self
+            .reader
+            .read_into_health(sender, cancelled, &mut self.status.health)
+            .is_break()
+        {
+            return self.poll(sender, cancelled);
         }
         self.status()
     }
@@ -262,7 +345,7 @@ fn default_policy(defaults: &Path, key: &str) -> Result<Policy, String> {
     }
 }
 
-fn enabled(conf: &Path) -> Result<bool, String> {
+pub(super) fn enabled(conf: &Path) -> Result<bool, String> {
     match setting(conf, "ENABLED")?.to_ascii_lowercase().as_str() {
         "yes" => Ok(true),
         "no" => Ok(false),
@@ -439,24 +522,55 @@ fn parse_network(text: &str) -> Result<Option<Network>, String> {
     Ok((prefix != 0).then_some(Network { address, prefix }))
 }
 
-impl<I> UfwProvider<I> {
-    fn malformed(&mut self, message: impl Into<String>) {
-        self.status.malformed_records = self.status.malformed_records.saturating_add(1);
-        self.status.health = FirewallHealth::Degraded(message.into());
+/// `filter_IN_<zone>_REJECT:` or `filter_IN_<zone>_DROP:`, the first word of the message. The
+/// action ends the word, so a zone name may hold underscores or any character but whitespace.
+fn is_denied_input_prefix(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix("filter_IN_") else {
+        return false;
+    };
+    let zone = rest
+        .strip_suffix("_REJECT:")
+        .or_else(|| rest.strip_suffix("_DROP:"));
+    zone.is_some_and(|zone| !zone.is_empty())
+}
+
+impl BlockMarker {
+    /// Where the marker starts in `message` and where the kernel's fields start after it.
+    fn locate(self, message: &str) -> Option<(usize, usize)> {
+        match self {
+            BlockMarker::Ufw => {
+                let start = message.find(UFW_MARKER)?;
+                Some((start, start + UFW_MARKER.len()))
+            }
+            BlockMarker::Firewalld => {
+                let end = message.find(char::is_whitespace)?;
+                is_denied_input_prefix(&message[..end]).then_some((0, end))
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BlockMarker::Ufw => "UFW",
+            BlockMarker::Firewalld => "firewalld",
+        }
     }
 }
 
-fn normalize_record(record: &str) -> Result<Option<FirewallEvent>, String> {
+fn normalize_record(record: &str, marker: BlockMarker) -> Result<Option<FirewallEvent>, String> {
     let (message, timestamp) = journal_fields(record)?;
-    let Some(marker) = message.find("[UFW BLOCK]") else {
+    let Some((marker_start, fields_start)) = marker.locate(&message) else {
         return Ok(None);
     };
-    let fields: HashMap<&str, &str> = message[marker + "[UFW BLOCK]".len()..]
+    let fields: HashMap<&str, &str> = message[fields_start..]
         .split_whitespace()
         .filter_map(|field| field.split_once('='))
         .collect();
     if fields.is_empty() {
-        return Err("malformed UFW block record has no fields".to_owned());
+        return Err(format!(
+            "malformed {} block record has no fields",
+            marker.label()
+        ));
     }
 
     let incoming = nonempty(fields.get("IN").copied());
@@ -468,14 +582,12 @@ fn normalize_record(record: &str) -> Result<Option<FirewallEvent>, String> {
     };
 
     Ok(Some(FirewallEvent {
-        timestamp: timestamp.or_else(|| file_timestamp(&message, marker)),
+        timestamp: timestamp.or_else(|| file_timestamp(&message, marker_start)),
         direction,
         interface,
         protocol: fields.get("PROTO").and_then(|value| protocol(value)),
         source: endpoint(fields.get("SRC"), fields.get("SPT")),
         destination: endpoint(fields.get("DST"), fields.get("DPT")),
-        process: None,
-        outcome: FirewallOutcome::Blocked,
     }))
 }
 
@@ -559,10 +671,6 @@ impl FirewallInput for IdleInput {
 
 fn with_system_rules<I: FirewallInput>(provider: UfwProvider<I>, conf: &Path) -> UfwProvider<I> {
     provider.with_rule_files(conf, UFW_DEFAULTS, USER_RULES, USER6_RULES)
-}
-
-pub(super) fn create(source: &UfwSource) -> Box<dyn FirewallProvider> {
-    create_with_conf(source, Path::new(UFW_CONF))
 }
 
 /// Builds the UFW provider, reading UFW's on/off and logging settings from `conf`.
@@ -737,6 +845,13 @@ impl<P: JournalProcess> FirewallInput for JournalInput<P> {
     fn shutdown(&mut self) -> io::Result<()> {
         self.process.terminate_and_wait()
     }
+}
+
+/// The kernel journal, followed from now on.
+pub(super) fn journal_input() -> io::Result<Box<dyn FirewallInput>> {
+    CommandJournalProcess::spawn()
+        .map(JournalInput::new)
+        .map(|input| Box::new(input) as Box<dyn FirewallInput>)
 }
 
 pub(super) struct CommandJournalProcess {

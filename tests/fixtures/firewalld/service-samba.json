@@ -1,0 +1,1 @@
+{"type":"a{sv}","data":[{"short":{"type":"s","data":"Samba"},"description":{"type":"s","data":"This option allows you to access and participate in Windows file and printer sharing networks. You need the samba package installed for this option to be useful."},"ports":{"type":"a(ss)","data":[["139","tcp"],["445","tcp"]]},"includes":{"type":"as","data":["samba-client"]}}]}

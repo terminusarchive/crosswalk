@@ -39,6 +39,7 @@ fn counters(name: &str, address: [u8; 4], received: u64, transmitted: u64) -> In
             ip: IpAddr::V4(Ipv4Addr::from(address)),
             prefix: 24,
         }],
+        is_up: true,
         received_bytes: received,
         transmitted_bytes: transmitted,
     }
@@ -417,4 +418,46 @@ fn an_unreadable_resolver_file_keeps_the_last_name_servers_and_an_empty_one_clea
     let empty = collector.sample(Duration::from_secs(2));
     assert!(empty.name_servers.is_empty());
     assert_eq!(empty.name_server, None);
+}
+
+#[test]
+fn an_interface_the_collector_was_told_is_down_is_carried_as_down_and_back_up() {
+    let down = |is_up| InterfaceCounters {
+        is_up,
+        ..counters("eth0", [192, 0, 2, 10], 1, 1)
+    };
+    let source = SequenceSource::new(vec![Ok(vec![down(false)]), Ok(vec![down(true)])]);
+    let mut collector = InterfaceCounterCollector::new(source);
+    let first = collector.sample(Duration::from_secs(0));
+    assert!(!first.interfaces[0].is_up);
+    let second = collector.sample(Duration::from_secs(1));
+    assert!(second.interfaces[0].is_up);
+}
+
+#[test]
+fn the_system_flags_decide_up_and_an_interface_it_does_not_list_is_not_taken_for_down() {
+    let dir = std::env::temp_dir().join(format!("crosswalk-flags-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let counters = dir.join("dev");
+    std::fs::write(
+        &counters,
+        "Inter-|   Receive\n face |bytes packets\n\
+         lo: 10 0 0 0 0 0 0 0 10 0 0 0 0 0 0 0\n\
+         nosuch9: 20 0 0 0 0 0 0 0 30 0 0 0 0 0 0 0\n",
+    )
+    .unwrap();
+    let mut collector = InterfaceCounterCollector::new(LinuxInterfaceSource::with_paths(
+        &counters,
+        dir.join("route"),
+    ));
+    let snapshot = collector.sample(Duration::from_secs(0));
+    let is_up = |name: &str| {
+        let found = snapshot.interfaces.iter().find(|i| i.name == name);
+        found.unwrap().is_up
+    };
+    assert!(
+        is_up("lo"),
+        "loopback is administratively up on the test machine"
+    );
+    assert!(is_up("nosuch9"));
 }
