@@ -14,7 +14,8 @@ use super::{
 use crate::{
     collect::{
         attribution::{AttributionHealth, ExecutableIdentity},
-        capture::{CaptureHealth, Direction, Protocol},
+        capture::{CaptureHealth, CaptureOrigin, Direction, Protocol},
+        dumpcap::stopped_reason,
         interfaces::CollectionHealth,
         neighbors::Neighbor,
     },
@@ -1172,6 +1173,10 @@ impl Level {
 
 pub fn indicators(state: &AppState) -> [(&'static str, Level); 4] {
     let health = state.source_health();
+    let capture_name = match health.capture.as_ref().map(|s| s.origin) {
+        Some(CaptureOrigin::Dumpcap) => "capture (dumpcap)",
+        Some(CaptureOrigin::Own) | None => "capture",
+    };
     let capture = health
         .capture
         .as_ref()
@@ -1206,7 +1211,7 @@ pub fn indicators(state: &AppState) -> [(&'static str, Level); 4] {
             AttributionHealth::Unavailable(_) => Level::Bad,
         });
     [
-        ("capture", capture),
+        (capture_name, capture),
         ("firewall", firewall),
         ("interfaces", interfaces),
         ("apps", apps),
@@ -1218,6 +1223,12 @@ fn unreadable_rules(why: &str) -> String {
         "Cannot read firewall rules ({}). See docs/firewall.md",
         reason(why)
     )
+}
+
+/// What `dumpcap` gave, whole but for a bound on a runaway line: the pane wraps it over
+/// its rows and cuts the end with an ellipsis when it still does not fit.
+fn dumpcap_reason(text: &str) -> String {
+    whole_text(text).chars().take(200).collect()
 }
 
 fn reason(text: &str) -> String {
@@ -1232,10 +1243,16 @@ pub fn notice(state: &AppState, pane: Pane) -> Option<String> {
     let capture = || {
         health.capture.as_ref().and_then(|s| match &s.health {
             CaptureHealth::Available => None,
-            CaptureHealth::Degraded(r) => Some(format!(
-                "Packet capture is degraded ({}). See the README.",
-                reason(r)
-            )),
+            CaptureHealth::Degraded(r) => Some(match s.origin {
+                CaptureOrigin::Dumpcap => format!(
+                    "Capture through dumpcap has stopped: {}",
+                    dumpcap_reason(stopped_reason(r).unwrap_or(r))
+                ),
+                CaptureOrigin::Own => format!(
+                    "Packet capture is degraded ({}). See the README.",
+                    reason(r)
+                ),
+            }),
             CaptureHealth::Cancelled => Some("Packet capture has stopped.".to_owned()),
         })
     };

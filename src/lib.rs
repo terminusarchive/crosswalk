@@ -1,4 +1,5 @@
 pub mod attribution_log;
+pub mod capture_source;
 pub mod collect;
 mod command;
 pub mod config;

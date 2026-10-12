@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SYSTEM_DIRECTORIES: [&str; 5] = [
+use crate::{privileges::give_up_everything, runtime::or_stop};
+
+pub(crate) const SYSTEM_DIRECTORIES: [&str; 5] = [
     "/usr/bin",
     "/usr/sbin",
     "/bin",
@@ -23,12 +25,17 @@ pub(crate) fn system_command(name: &str) -> Command {
     Command::new(program_in(name, &directories))
 }
 
-fn program_in(name: &str, directories: &[&Path]) -> PathBuf {
+/// The first of `directories` holding a file called `name`. The one lookup both for
+/// running a helper and for judging whether it may be run.
+pub(crate) fn find_program_in(name: &str, directories: &[&Path]) -> Option<PathBuf> {
     directories
         .iter()
         .map(|directory| directory.join(name))
         .find(|path| path.is_file())
-        .unwrap_or_else(|| Path::new("/usr/bin").join(name))
+}
+
+fn program_in(name: &str, directories: &[&Path]) -> PathBuf {
+    find_program_in(name, directories).unwrap_or_else(|| Path::new("/usr/bin").join(name))
 }
 
 /// Runs a command to completion, killing it if it outlives `timeout` or if
@@ -71,6 +78,8 @@ pub(crate) fn run_within(
 
 fn read_in_background(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
+        // The thread that starts this one may have `cap_sys_ptrace` available.
+        or_stop(give_up_everything());
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {
             let _ = pipe.read_to_end(&mut bytes);

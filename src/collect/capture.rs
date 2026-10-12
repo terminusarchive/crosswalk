@@ -352,6 +352,35 @@ pub trait CaptureSource {
     fn link_type(&self) -> i32;
     fn next_packet(&mut self) -> Result<PacketRead, String>;
     fn statistics(&mut self) -> Result<CaptureStatistics, String>;
+
+    fn origin(&self) -> CaptureOrigin {
+        CaptureOrigin::Own
+    }
+}
+
+impl CaptureSource for Box<dyn CaptureSource> {
+    fn link_type(&self) -> i32 {
+        (**self).link_type()
+    }
+
+    fn next_packet(&mut self) -> Result<PacketRead, String> {
+        (**self).next_packet()
+    }
+
+    fn statistics(&mut self) -> Result<CaptureStatistics, String> {
+        (**self).statistics()
+    }
+
+    fn origin(&self) -> CaptureOrigin {
+        (**self).origin()
+    }
+}
+
+/// Where the packets come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureOrigin {
+    Own,
+    Dumpcap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -368,6 +397,7 @@ pub struct CaptureStatus {
     pub capture_received: u32,
     pub capture_dropped: u32,
     pub delivery_dropped: u64,
+    pub origin: CaptureOrigin,
 }
 
 pub struct CaptureWorker<S> {
@@ -416,6 +446,7 @@ impl<S: CaptureSource> CaptureWorker<S> {
                 capture_received: 0,
                 capture_dropped: 0,
                 delivery_dropped: self.delivery_dropped,
+                origin: self.source.origin(),
             };
         }
 
@@ -476,6 +507,7 @@ impl<S: CaptureSource> CaptureWorker<S> {
                 .dropped
                 .saturating_add(statistics.interface_dropped),
             delivery_dropped: self.delivery_dropped,
+            origin: self.source.origin(),
         }
     }
 }

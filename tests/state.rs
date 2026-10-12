@@ -9,7 +9,8 @@ use crosswalk::{
             AttributionHealth, AttributionStatus, ExecutableIdentity, Listener, ProcessIdentity,
         },
         capture::{
-            CaptureHealth, CaptureStatus, Direction, Endpoint, Protocol, TcpFlags, TrafficEvent,
+            CaptureHealth, CaptureOrigin, CaptureStatus, Direction, Endpoint, Protocol, TcpFlags,
+            TrafficEvent,
         },
         interfaces::{CollectionHealth, InterfaceMeasurement, InterfaceSnapshot, InterfaceStatus},
     },
@@ -159,6 +160,7 @@ fn each_sources_health_is_stored_independently_of_the_others() {
         capture_received: 0,
         capture_dropped: 0,
         delivery_dropped: 0,
+        origin: CaptureOrigin::Own,
     });
     assert_eq!(none(&state), [false, false, true, false]);
 
@@ -204,6 +206,7 @@ fn each_sources_health_is_stored_independently_of_the_others() {
         capture_received: 1,
         capture_dropped: 0,
         delivery_dropped: 0,
+        origin: CaptureOrigin::Own,
     });
     let health = state.source_health();
     assert_eq!(
@@ -2134,4 +2137,19 @@ fn app_history_keeps_download_and_upload_apart() {
     );
     state.record_traffic(secs(10), inbound_from("198.51.100.1", 90), Some(a));
     assert_eq!(history_of(&state)[7], (90, 30));
+}
+
+#[test]
+fn the_capture_status_keeps_which_source_it_came_from() {
+    let mut state = AppState::new(StateLimits::default()).unwrap();
+    state.record_capture_status(CaptureStatus {
+        health: CaptureHealth::Available,
+        packets_read: 1,
+        capture_received: 0,
+        capture_dropped: 0,
+        delivery_dropped: 0,
+        origin: CaptureOrigin::Dumpcap,
+    });
+    let status = state.source_health().capture.clone().unwrap();
+    assert_eq!(status.origin, CaptureOrigin::Dumpcap);
 }

@@ -18,7 +18,7 @@ The screenshots use made-up data, in the synthwave, tokyo-night and catppuccin t
 
 - Linux, Rust and Cargo (edition 2024), and a C toolchain.
 - libpcap development files (`libpcap-dev` on Debian and Ubuntu).
-- Packet-capture privilege: run with `sudo`, or grant two capabilities once (see [Running without sudo](#running-without-sudo)).
+- Packet-capture privilege: run with `sudo`, grant two capabilities once, or let Wireshark's `dumpcap` capture (see [Running without sudo](#running-without-sudo)).
 - UFW and `journalctl` for the firewall panes. Crosswalk reads UFW's files and never runs `ufw`.
 - `ip` (iproute2) for Neighbors.
 - Optional: `nmcli` (NetworkManager) for Wi-Fi Networks.
@@ -55,12 +55,14 @@ Crosswalk needs privilege to capture packets and to see which process owns anoth
 sudo setcap cap_net_raw,cap_sys_ptrace+ep <path to the crosswalk binary>
 ```
 
-Crosswalk does not run `setcap` for you. Without `cap_net_raw` it prints this command and exits. Replacing the file clears the grant, so repeat the command after each build or install.
+Crosswalk does not run `setcap` for you. Without `cap_net_raw`, and with no `dumpcap` it may run, it prints this command and exits. Replacing the file clears the grant, so repeat the command after each build or install.
 
 - `cap_net_raw` lets Crosswalk capture packets.
 - `cap_sys_ptrace` lets it name other users' programs. It can read and control any process, root's included, so it is close to root-equivalent. Grant it only to a binary you trust.
 
 `cap_net_raw` alone works. Other users' programs are then counted as not attributed.
+
+Crosswalk gives up `cap_net_raw` once the capture is open, and puts `cap_sys_ptrace` in effect only while it scans `/proc`.
 
 The grant belongs to the file. Anyone who can write to the file can run their own code with these capabilities. For a hardened install, copy the binary to a root-owned place first:
 
@@ -74,6 +76,18 @@ sudo setcap cap_net_raw,cap_sys_ptrace+ep /usr/local/bin/crosswalk
 The group takes effect at your next login. Repeat `install` and `setcap` after each build. Remove the grant with `sudo setcap -r <path>`.
 
 The capabilities do not grant access to the kernel journal or to UFW's rule files. The [manual](docs/manual.md#what-you-are-granting) covers both, and what you see when each capability is missing.
+
+### Through Wireshark's dumpcap
+
+If Wireshark's `dumpcap` is installed and your account may run it, a Crosswalk binary without `cap_net_raw` captures through it. Nothing is granted to Crosswalk, and nothing needs repeating after a build.
+
+```sh
+sudo usermod -aG wireshark "$USER"
+```
+
+Log in again afterwards. `newgrp` is not enough: Crosswalk then cannot name your own programs. The header reads `capture (dumpcap)` when packets come this way.
+
+A binary that holds `cap_net_raw`, or runs under `sudo`, captures by itself. With neither way available, Crosswalk prints both and exits; its message names the group on your system.
 
 ## Keys
 

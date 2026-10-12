@@ -10,7 +10,7 @@ The [README](../README.md) is the short version. This is the reference: the full
 
 - Linux with Rust and Cargo (edition 2024 toolchain).
 - libpcap development files and a C toolchain (`libpcap-dev` on Debian/Ubuntu, or the equivalent package for your distribution).
-- Packet-capture privileges to observe traffic. There are two ways to get them: run the binary with `sudo`, or grant it two capabilities once and run it as yourself (see [Running without sudo](#running-without-sudo)).
+- Packet-capture privileges to observe traffic. There are three ways to get them: run the binary with `sudo`, grant it two capabilities once and run it as yourself, or let Wireshark's `dumpcap` capture for it (see [Running without sudo](#running-without-sudo)).
 - UFW and `journalctl` for the default firewall source. Crosswalk never runs `ufw`; it reads UFW's configuration and rule files. Where those files are readable only by root, Listening Ports and Firewall Rules need `sudo` (see [Running without sudo](#running-without-sudo)). Firewall reporting is independent of packet capture.
 - The `ip` command (from `iproute2`, present on nearly every Linux system) for the Neighbors pane.
 - Optional: the `nmcli` command (from NetworkManager) for the Wi-Fi Networks pane. Without it, or without NetworkManager running, that pane says so and the rest of Crosswalk is unaffected. It is also what makes the one key that transmits, `r` (see [Wi-Fi Networks](#wi-fi-networks)), work.
@@ -96,18 +96,20 @@ Crosswalk needs privilege for two things only: capturing packets, and reading wh
 sudo setcap cap_net_raw,cap_sys_ptrace+ep <path to the crosswalk binary>
 ```
 
-Then run `crosswalk` as yourself. Crosswalk does not run `setcap` for you. Whenever it is started without `cap_net_raw`, it prints this command with its own absolute path.
+Then run `crosswalk` as yourself. Crosswalk does not run `setcap` for you. Whenever it is started without `cap_net_raw`, and with no `dumpcap` it may run, it prints this command with its own absolute path.
 
 Repeat the command after each build or install: replacing the file clears its capabilities.
 
 - `cap_net_raw` lets Crosswalk capture packets.
 - `cap_sys_ptrace` lets Crosswalk read which process owns a socket that belongs to another user. A process holding it can read and control any other process on the machine, root's included, so it is close to root-equivalent. Granting it removes the password prompt and avoids running the whole program as root, but treat it as granting root-level trust to that binary, and grant it only to a binary you trust.
 
+Crosswalk holds each capability only where it uses it. It takes both out of effect before it reads its configuration, gives up `cap_net_raw` for good once the capture is open, and puts `cap_sys_ptrace` in effect only for the length of each scan of `/proc`, on the two threads that scan it. Under `sudo` nothing is changed.
+
 `cap_net_raw` alone is a real option: grant only that (`sudo setcap cap_net_raw+ep <path>`) and Crosswalk runs without naming other users' programs, as described next.
 
 What you see with each missing:
 
-- Without `cap_net_raw`, Crosswalk prints the message with the command and exits without opening the dashboard.
+- Without `cap_net_raw`, Crosswalk captures through `dumpcap` if it may run it (see [Through Wireshark's dumpcap](#through-wiresharks-dumpcap)). Otherwise it prints the message with the command, and the `dumpcap` way that fits the machine, and exits without opening the dashboard.
 - With `cap_net_raw` but without `cap_sys_ptrace`, Crosswalk runs. It names the programs you own and counts other users' traffic in App Traffic's not-attributed total. App Traffic shows a line saying that other users' programs cannot be named and that `cap_sys_ptrace` is needed, and the `apps` indicator in the header turns orange. In Listening Ports, a port owned by another user's process shows `—` for its app.
 
 The grant has no effect if the binary is on a filesystem mounted `nosuid`, or on one that cannot store capabilities. Crosswalk then prints the same message again. `getcap <path>` shows what a file holds, and `findmnt -no OPTIONS --target <dir>` shows the mount options of the filesystem that holds `<dir>`; look for `nosuid` in the list.
@@ -138,6 +140,23 @@ Two things the capabilities do not cover:
 - **UFW's files.** Crosswalk reads `/etc/ufw/ufw.conf`, `/etc/default/ufw`, `/etc/ufw/user.rules` and `/etc/ufw/user6.rules`. Some distributions, Debian and Ubuntu among them, keep the rule files readable only by root. Where they do, Firewall Rules and the exposure column in Listening Ports show their "cannot be read" state, and `sudo` is the way to run there. See [docs/firewall.md](firewall.md).
 
 Running with `sudo` is still supported and behaves as before; it prints no message about capabilities.
+
+#### Through Wireshark's dumpcap
+
+Wireshark installs a small capture program, `dumpcap`, with its own capabilities, runnable by the members of one group (`wireshark` on most distributions). If it is installed and your account may run it, a Crosswalk binary that does not hold `cap_net_raw` starts it and reads the packets from it. Nothing is granted to the Crosswalk binary, so there is nothing to repeat after a build or install.
+
+```sh
+sudo usermod -aG wireshark "$USER"
+```
+
+Log in again afterwards, so that the group applies. `newgrp wireshark` is not enough: it makes `wireshark` the primary group of that shell, and Crosswalk then cannot name your own programs started elsewhere.
+
+- The header's capture indicator reads `capture (dumpcap)` when packets come this way, and `capture` when Crosswalk captures by itself.
+- A binary that holds `cap_net_raw`, or runs under `sudo`, captures by itself and does not start `dumpcap`. There is no option to choose.
+- `dumpcap` only captures. Which program owns a connection is still worked out by Crosswalk, so App Traffic shows the same line about other users' programs as any run without `cap_sys_ptrace`.
+- If `dumpcap` stops while the dashboard is open, the capture indicator turns orange and App Traffic shows "Capture through dumpcap has stopped" with the reason. The traffic already shown stays and the other panes keep working. Crosswalk does not start it again; quit and start Crosswalk again.
+- `dumpcap` is started by its absolute path from the system directories and stopped when Crosswalk quits.
+- With no `cap_net_raw` and no `dumpcap` it may run, Crosswalk prints the `setcap` command and then either the `usermod` command for the group that owns `dumpcap` on your system, or a line saying that installing `dumpcap` is the other way.
 
 ## The display
 

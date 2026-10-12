@@ -6,7 +6,10 @@ use crosswalk::{
         attribution::{
             AttributionHealth, AttributionStatus, ExecutableIdentity, Listener, ProcessIdentity,
         },
-        capture::{CaptureHealth, CaptureStatus, Direction, Endpoint, Protocol, TrafficEvent},
+        capture::{
+            CaptureHealth, CaptureOrigin, CaptureStatus, Direction, Endpoint, Protocol,
+            TrafficEvent,
+        },
         interfaces::{CollectionHealth, InterfaceMeasurement, InterfaceSnapshot, InterfaceStatus},
     },
     firewall::{
@@ -634,6 +637,7 @@ mod overview {
             capture_received: 1,
             capture_dropped: 0,
             delivery_dropped: 0,
+            origin: CaptureOrigin::Own,
         });
         state.record_attribution_status(AttributionStatus {
             health: AttributionHealth::Available,
@@ -2290,6 +2294,7 @@ mod overview {
             capture_received: 0,
             capture_dropped: 0,
             delivery_dropped: 0,
+            origin: CaptureOrigin::Own,
         });
         state.record_firewall_status(FirewallStatus {
             health: FirewallHealth::Disabled("logging off".into()),
@@ -2454,12 +2459,105 @@ mod overview {
             capture_received: 0,
             capture_dropped: 0,
             delivery_dropped: 0,
+            origin: CaptureOrigin::Own,
         });
         let pane = app_traffic_pane(&state);
         let text = pane.join("\n");
         assert!(text.contains("Packet capture is degraded"), "{text}");
         assert!(text.contains("DESTINATION"), "{text}");
         assert_eq!(data_rows_shown(&pane), 3, "{text}");
+    }
+
+    fn capture_status(health: CaptureHealth, origin: CaptureOrigin) -> CaptureStatus {
+        CaptureStatus {
+            health,
+            packets_read: 0,
+            capture_received: 0,
+            capture_dropped: 0,
+            delivery_dropped: 0,
+            origin,
+        }
+    }
+
+    #[test]
+    fn the_header_names_dumpcap_as_the_capture_source_only_when_it_is() {
+        for (origin, shown) in [
+            (CaptureOrigin::Dumpcap, "● capture (dumpcap)  ● firewall"),
+            (CaptureOrigin::Own, "● capture  ● firewall"),
+        ] {
+            let mut state = AppState::new(StateLimits::default()).unwrap();
+            state.record_capture_status(capture_status(CaptureHealth::Available, origin));
+            let mut i = Interaction::default();
+            let header = header_of(&screen(&state, &mut i, None, 110, 24));
+            assert!(header.contains(shown), "{header:?}");
+        }
+    }
+
+    #[test]
+    fn app_traffic_says_capture_through_dumpcap_has_stopped_with_the_reason_dumpcap_gave() {
+        let mut state = three_apps_and_unowned();
+        state.record_capture_status(capture_status(
+            CaptureHealth::Degraded(
+                "capture through dumpcap has stopped: dumpcap: You do not have permission to capture on that device"
+                    .into(),
+            ),
+            CaptureOrigin::Dumpcap,
+        ));
+        let pane = app_traffic_pane(&state);
+        let text = pane.join(" ");
+        assert!(
+            text.contains("Capture through dumpcap has stopped: dumpcap: You do not"),
+            "{text}"
+        );
+        assert!(text.contains("permission to capture on that"), "{text}");
+        assert!(!text.contains("stopped: capture through"), "{text}");
+        assert!(!text.contains("Packet capture is degraded"), "{text}");
+        assert_eq!(data_rows_shown(&pane), 3, "{text}");
+    }
+
+    #[test]
+    fn app_traffic_shows_the_dumpcap_line_for_a_dumpcap_stop_without_the_sources_prefix() {
+        let message = "capture device must provide Linux cooked v2 headers, not link type 1";
+        let mut state = three_apps_and_unowned();
+        state.record_capture_status(capture_status(
+            CaptureHealth::Degraded(message.into()),
+            CaptureOrigin::Dumpcap,
+        ));
+        let text = app_traffic_pane(&state).join(" ");
+        assert!(
+            text.contains("Capture through dumpcap has stopped: capture device must provide"),
+            "{text}"
+        );
+        assert!(text.contains("not link type 1"), "{text}");
+        assert!(!text.contains("Packet capture is degraded"), "{text}");
+    }
+
+    #[test]
+    fn app_traffic_keeps_the_generic_line_for_an_own_capture_whatever_its_message_begins_with() {
+        let mut state = three_apps_and_unowned();
+        state.record_capture_status(capture_status(
+            CaptureHealth::Degraded("capture through dumpcap has stopped: odd".into()),
+            CaptureOrigin::Own,
+        ));
+        let text = app_traffic_pane(&state).join(" ");
+        assert!(text.contains("Packet capture is degraded"), "{text}");
+        assert!(!text.contains("Capture through dumpcap"), "{text}");
+    }
+
+    #[test]
+    fn app_traffic_keeps_the_signal_dumpcap_ended_with_in_its_line() {
+        let mut state = three_apps_and_unowned();
+        state.record_capture_status(capture_status(
+            CaptureHealth::Degraded(
+                "capture through dumpcap has stopped: it was ended by signal 9".into(),
+            ),
+            CaptureOrigin::Dumpcap,
+        ));
+        let text = app_traffic_pane(&state).join(" ");
+        assert!(
+            text.contains("Capture through dumpcap has stopped: it was ended by signal 9"),
+            "{text}"
+        );
     }
 
     #[test]

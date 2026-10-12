@@ -12,10 +12,14 @@ use crosswalk::{
 };
 use ratatui::style::Color;
 
+mod common;
+
+const BINARY: &str = env!("CARGO_BIN_EXE_crosswalk");
+
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn crosswalk(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_crosswalk"))
+    Command::new(BINARY)
         .args(args)
         .output()
         .expect("crosswalk should run")
@@ -255,8 +259,11 @@ fn an_attribution_log_that_cannot_be_opened_stops_startup_naming_the_file() {
 
 #[test]
 fn without_net_raw_the_capability_check_stops_startup_before_the_attribution_log() {
-    if holds_net_raw() {
-        eprintln!("skipped: this process holds cap_net_raw");
+    if holds_net_raw()
+        || common::binary_is_granted_capabilities(BINARY)
+        || common::dumpcap_is_runnable()
+    {
+        eprintln!("skipped: the binary would hold cap_net_raw or capture through dumpcap");
         return;
     }
     let path = std::env::temp_dir().join("crosswalk-no-such-directory/attribution.log");

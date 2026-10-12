@@ -22,7 +22,11 @@ use crate::{
             AttributionCollector, AttributionHealth, AttributionResult, LinuxProcfsSource, NoOwner,
             NoOwnerCause, OwnerMemory, ProcessIdentity,
         },
-        capture::{CaptureHealth, CaptureWorker, PcapSource, Protocol, TrafficEvent},
+        capture::{
+            CaptureHealth, CaptureOrigin, CaptureSource, CaptureWorker, PcapSource, Protocol,
+            TrafficEvent,
+        },
+        dumpcap::{DumpcapSource, dumpcap_command},
         interfaces::{
             CollectionHealth, InterfaceCounterCollector, InterfaceSnapshot, InterfaceStatus,
             LinuxInterfaceSource,
@@ -32,7 +36,10 @@ use crate::{
     },
     config::Config,
     firewall::{self, FirewallEvent, FirewallProvider, FirewallStatus, RuleSnapshot},
-    privileges::Capabilities,
+    privileges::{
+        Capabilities, PrivilegeError, enable_net_raw_if_available, give_up_everything,
+        keep_only_sys_ptrace_available, with_sys_ptrace,
+    },
     state::{AppState, DEFAULT_EPHEMERAL_PORTS, left_out_of_app_traffic},
 };
 
@@ -226,6 +233,7 @@ impl LiveWorkers {
         sender: SyncSender<DashboardEvent>,
         attribution_log: Option<AttributionLog>,
         capabilities: Option<Capabilities>,
+        origin: CaptureOrigin,
     ) -> Self {
         // Unknown capabilities show nothing; only a known missing one is limited.
         let limited = capabilities.is_some_and(|c| !c.sys_ptrace);
@@ -237,7 +245,13 @@ impl LiveWorkers {
             thread::Builder::new()
                 .name("crosswalk-capture".to_owned())
                 .spawn(move || {
-                    capture_loop(capture_sender, capture_cancelled, attribution_log, limited)
+                    capture_loop(
+                        capture_sender,
+                        capture_cancelled,
+                        attribution_log,
+                        limited,
+                        origin,
+                    )
                 })
                 .expect("capture worker thread creation failed"),
         );
@@ -266,6 +280,7 @@ impl LiveWorkers {
             thread::Builder::new()
                 .name("crosswalk-firewall".to_owned())
                 .spawn(move || {
+                    or_stop(give_up_everything());
                     let mut provider = firewall::create_provider(&config);
                     firewall_loop(provider.as_mut(), sender, firewall_cancelled)
                 })
@@ -306,6 +321,18 @@ fn capture_open_failed(error: &str) -> String {
     format!("README, Running without sudo: {error}")
 }
 
+/// The capture to read packets from. Opening `dumpcap` waits for its stream to begin, so
+/// this belongs on the capture thread.
+fn open_capture(origin: CaptureOrigin) -> Result<Box<dyn CaptureSource>, String> {
+    match origin {
+        CaptureOrigin::Own => PcapSource::open_any()
+            .map(|source| Box::new(source) as Box<dyn CaptureSource>)
+            .map_err(|error| capture_open_failed(&error)),
+        CaptureOrigin::Dumpcap => DumpcapSource::new(dumpcap_command())
+            .map(|source| Box::new(source) as Box<dyn CaptureSource>),
+    }
+}
+
 /// The addresses of the interfaces present in an interface reading; nothing when the
 /// reading could not be made, so the addresses already in use stay. An interface that
 /// has gone keeps its last addresses in the snapshot, but they are no longer ours.
@@ -325,6 +352,7 @@ fn capture_loop(
     cancelled: Arc<AtomicBool>,
     mut log: Option<AttributionLog>,
     limited: bool,
+    origin: CaptureOrigin,
 ) {
     let (traffic_sender, traffic_receiver) = sync_channel(256);
     let mut interface_collector = InterfaceCounterCollector::new(LinuxInterfaceSource::new());
@@ -348,16 +376,20 @@ fn capture_loop(
             None
         }
     };
-    let source = match PcapSource::open_any() {
+    or_stop(enable_net_raw_if_available());
+    let opened = open_capture(origin);
+    or_stop(keep_only_sys_ptrace_available());
+    let source = match opened {
         Ok(source) => source,
         Err(error) => {
             let _ = sender.try_send(DashboardEvent::CaptureStatus(
                 crate::collect::capture::CaptureStatus {
-                    health: CaptureHealth::Degraded(capture_open_failed(&error)),
+                    health: CaptureHealth::Degraded(error),
                     packets_read: 0,
                     capture_received: 0,
                     capture_dropped: 0,
                     delivery_dropped: 0,
+                    origin,
                 },
             ));
             return;
@@ -373,6 +405,7 @@ fn capture_loop(
                     capture_received: 0,
                     capture_dropped: 0,
                     delivery_dropped: 0,
+                    origin,
                 },
             ));
             return;
@@ -422,7 +455,7 @@ fn capture_loop(
         if hold.snapshot_due(now) {
             let mut released = Vec::new();
             if let Some(attribution) = attribution.as_mut() {
-                let mut status = attribution.refresh(now);
+                let mut status = scan_proc(|| attribution.refresh(now));
                 status.limited = limited;
                 let available = status.health == AttributionHealth::Available;
                 let _ = sender.try_send(DashboardEvent::Attribution(status));
@@ -528,6 +561,7 @@ fn metrics_loop(
     scan_requested: Arc<AtomicBool>,
     limited: bool,
 ) {
+    or_stop(keep_only_sys_ptrace_available());
     let mut collector = InterfaceCounterCollector::new(LinuxInterfaceSource::new());
     let start = Instant::now();
     let mut attribution = AttributionCollector::new(
@@ -550,7 +584,7 @@ fn metrics_loop(
         let now = start.elapsed();
         let _ = sender.try_send(DashboardEvent::Interfaces(collector.sample(now)));
         if let Some(collector) = attribution.as_mut() {
-            let mut status = collector.refresh(now);
+            let mut status = scan_proc(|| collector.refresh(now));
             status.limited = limited;
             let _ = sender.try_send(DashboardEvent::Attribution(status));
             if pending_listeners.is_none()
@@ -662,9 +696,32 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, cursor::Show);
-        let _ = terminal::disable_raw_mode();
+        restore_terminal();
     }
+}
+
+fn restore_terminal() {
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen, cursor::Show);
+    let _ = terminal::disable_raw_mode();
+}
+
+/// Stops Crosswalk from a worker thread, which cannot return the error to `main`:
+/// leaves the terminal as it was, says what failed and exits with status 1.
+fn stop_for_privilege_failure(error: PrivilegeError) -> ! {
+    restore_terminal();
+    eprintln!("crosswalk: {error}");
+    std::process::exit(1);
+}
+
+pub(crate) fn or_stop(result: Result<(), PrivilegeError>) {
+    if let Err(error) = result {
+        stop_for_privilege_failure(error);
+    }
+}
+
+/// Runs a scan of `/proc` with `cap_sys_ptrace` in effect for its length only.
+fn scan_proc<T>(scan: impl FnOnce() -> T) -> T {
+    with_sys_ptrace(scan).unwrap_or_else(|error| stop_for_privilege_failure(error))
 }
 
 fn sleep_cancelled(duration: Duration, cancelled: &AtomicBool) {
