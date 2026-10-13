@@ -2091,40 +2091,42 @@ fn app_history_sums_its_destinations_in_the_same_second() {
     let a = process("/opt/a", 1);
     state.record_traffic(secs(13), inbound_from("198.51.100.1", 400), Some(a.clone()));
     state.record_traffic(secs(13), inbound_from("198.51.100.2", 400), Some(a));
-    assert_eq!(history_of(&state)[7], (800, 0));
+    assert_eq!(history_of(&state)[119], (800, 0));
 }
 
 #[test]
-fn app_history_puts_an_older_destination_second_back_not_at_the_end() {
+fn app_history_puts_bytes_from_a_hundred_seconds_ago_at_their_second() {
     let mut state = AppState::new(StateLimits::default()).unwrap();
     let a = process("/opt/a", 1);
     state.record_traffic(secs(10), inbound_from("198.51.100.1", 5), Some(a.clone()));
-    state.record_traffic(secs(13), inbound_from("198.51.100.2", 7), Some(a));
-    assert_eq!(
-        history_of(&state),
-        vec![
-            (0, 0),
-            (0, 0),
-            (0, 0),
-            (0, 0),
-            (5, 0),
-            (0, 0),
-            (0, 0),
-            (7, 0)
-        ]
-    );
+    state.record_traffic(secs(110), inbound_from("198.51.100.2", 7), Some(a));
+    let history = history_of(&state);
+    assert_eq!(history.len(), 120);
+    assert_eq!(history[119], (7, 0));
+    assert_eq!(history[19], (5, 0));
+    assert_eq!(history.iter().filter(|s| **s != (0, 0)).count(), 2);
 }
 
 #[test]
-fn app_history_is_empty_after_eight_idle_seconds() {
+fn app_history_drops_bytes_older_than_two_minutes() {
+    let mut state = AppState::new(StateLimits::default()).unwrap();
+    let a = process("/opt/a", 1);
+    state.record_traffic(secs(10), inbound_from("198.51.100.1", 5), Some(a.clone()));
+    state.record_traffic(secs(130), inbound_from("198.51.100.2", 7), Some(a));
+    assert_eq!(history_of(&state)[119], (7, 0));
+    assert!(history_of(&state)[..119].iter().all(|s| *s == (0, 0)));
+}
+
+#[test]
+fn app_history_is_empty_after_two_idle_minutes() {
     let mut state = AppState::new(StateLimits::default()).unwrap();
     state.record_traffic(
         secs(10),
         inbound_from("198.51.100.1", 5),
         Some(process("/opt/a", 1)),
     );
-    state.advance_time(secs(18));
-    assert_eq!(history_of(&state), vec![(0, 0); 8]);
+    state.advance_time(secs(130));
+    assert_eq!(history_of(&state), vec![(0, 0); 120]);
 }
 
 #[test]
@@ -2137,7 +2139,7 @@ fn app_history_keeps_download_and_upload_apart() {
         Some(a.clone()),
     );
     state.record_traffic(secs(10), inbound_from("198.51.100.1", 90), Some(a));
-    assert_eq!(history_of(&state)[7], (90, 30));
+    assert_eq!(history_of(&state)[119], (90, 30));
 }
 
 #[test]

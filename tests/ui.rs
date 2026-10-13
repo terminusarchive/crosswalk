@@ -1092,7 +1092,7 @@ mod overview {
             100,
         );
         let rows = app_traffic_rows(&state, &Theme::default(), "", None, None);
-        assert_eq!(rows[0].cells[0].text, "/usr/bin/evilxy");
+        assert_eq!(rows[0].cells[1].text, "/usr/bin/evilxy");
     }
 
     const HOSTILE: &str = "a\u{1b}[31m\u{7}b\u{202E}c\u{200B}d\u{2066}e\u{FEFF}f";
@@ -1128,15 +1128,15 @@ mod overview {
         let theme = Theme::default();
         let rows = app_traffic_rows(&state, &theme, "", None, None);
         // The path is cut from the left to App Traffic's 28 cells.
-        assert!(rows[0].cells[0].text.starts_with('…'));
+        assert!(rows[0].cells[1].text.starts_with('…'));
         assert!(
-            rows[0].cells[0]
+            rows[0].cells[1]
                 .text
                 .ends_with("xxxxxxxxxxxxxxxxxxxxxxxxxxx")
         );
-        assert_clean(&rows[0].cells[0].text, Some(28));
+        assert_clean(&rows[0].cells[1].text, Some(28));
         let rows = app_traffic_zoom_rows(&state, &theme, "", None);
-        assert_clean(&rows[0].cells[0].text, Some(48));
+        assert_clean(&rows[0].cells[1].text, Some(48));
         state.record_listeners(vec![listener(22, "0.0.0.0", Some(&long))], 32_768..=60_999);
         let rows = listening_rows(&state, &theme, "");
         assert_clean(&rows[0].cells[1].text, Some(48));
@@ -1175,7 +1175,7 @@ mod overview {
         let theme = Theme::default();
         let names: Vec<String> = app_traffic_rows(&state, &theme, "", None, None)
             .iter()
-            .map(|r| r.cells[0].text.clone())
+            .map(|r| r.cells[1].text.clone())
             .filter(|t| !t.is_empty())
             .collect();
         // App Traffic shows the path; the short name is for Listening Ports.
@@ -1191,7 +1191,7 @@ mod overview {
         );
         let found = app_traffic_rows(&state, &theme, "claude", None, None);
         assert_eq!(found.len(), 1);
-        assert!(found[0].cells[0].text.contains("claude"));
+        assert!(found[0].cells[1].text.contains("claude"));
 
         state.record_listeners(vec![listener(22, "0.0.0.0", Some(claude))], 32_768..=60_999);
         let rows = listening_rows(&state, &theme, "");
@@ -1254,11 +1254,11 @@ mod overview {
         assert!(dns.name(ip).is_some(), "lookup never finished");
         let theme = Theme::default();
         let rows = app_traffic_rows(&state, &theme, "", None, Some(&dns));
-        assert!(rows[0].cells[3].text.starts_with("a[31mbcdef"));
-        assert_clean(&rows[0].cells[3].text, Some(48));
+        assert!(rows[0].cells[2].text.starts_with("a[31mbcdef"));
+        assert_clean(&rows[0].cells[2].text, Some(48));
         let rows = app_traffic_zoom_rows(&state, &theme, "", Some(&dns));
-        assert!(rows[0].cells[9].text.starts_with("a[31mbcdef"));
-        assert_clean(&rows[0].cells[9].text, Some(48));
+        assert!(rows[0].cells[10].text.starts_with("a[31mbcdef"));
+        assert_clean(&rows[0].cells[10].text, Some(48));
     }
 
     #[test]
@@ -3468,7 +3468,7 @@ mod overview {
 
     #[test]
     fn app_traffic_zoom_lists_every_destination_with_the_extra_columns() {
-        let (_, _, text) = zoomed('2', 120, 32);
+        let (_, _, text) = zoomed('2', 132, 32);
         for visible in [
             "APP TRAFFIC",
             "PID",
@@ -5279,7 +5279,7 @@ mod overview {
         );
         state.advance_time(Duration::from_secs(2));
         let dns = blocked_dns(&[("203.0.113.9", &long), ("203.0.113.10", "short.example")]);
-        let text = names_screen(&state, &dns, &['2'], 110, 24);
+        let text = names_screen(&state, &dns, &['2'], 122, 24);
         let header = line_with(&text, "DESTINATION");
         let long_row = line_with(&text, &long);
         let short_row = line_with(&text, "short.example");
@@ -5290,8 +5290,8 @@ mod overview {
             assert_eq!(col(row, "443/tcp"), col(header, "PORT"), "{row}");
             assert_eq!(col(row, "B/s"), col(long_row, "B/s"));
         }
-        // The gap after a short name is the price of flush-right.
-        assert!(short_row.contains("short.example  "), "{short_row}");
+        // A short name still ends one space before its port.
+        assert!(short_row.contains("short.example 443/tcp"), "{short_row}");
     }
 
     #[test]
@@ -7016,7 +7016,7 @@ mod overview {
     }
 
     fn traffic_text(state: &AppState, i: &mut Interaction) -> Vec<String> {
-        lines(&screen(state, i, None, 110, 24))
+        lines(&screen(state, i, None, 122, 24))
     }
 
     fn app_row<'a>(rows: &'a [String], needle: &str) -> &'a str {
@@ -7026,12 +7026,12 @@ mod overview {
     }
 
     #[test]
-    fn app_traffic_overview_header_reads_app_pid_destination_port_rates_total() {
+    fn app_traffic_overview_header_reads_pid_app_destination_port_rates_total() {
         let rows = traffic_text(&path_state(), &mut Interaction::default());
         let header = app_row(&rows, "DESTINATION");
         let order = [
-            "APP",
             "PID",
+            "APP",
             "DESTINATION",
             "PORT",
             "↓ IN",
@@ -7049,26 +7049,108 @@ mod overview {
         let header = app_row(&rows, "DESTINATION");
         let firefox = app_row(&rows, "142.250.80.46");
         assert!(firefox.contains("/usr/lib/firefox/firefox"), "{firefox}");
-        assert_eq!(col(firefox, "/usr"), col(header, "APP"));
+        // Every PID ends one space before its app's path.
+        let pid_before_path = |row: &str, pid: &str, path: &str| {
+            end(row, pid) + 1 == col(row, path) && col(row, path) == col(header, "APP")
+        };
+        assert!(
+            pid_before_path(firefox, "4312", "/usr/lib/firefox/firefox"),
+            "{firefox}"
+        );
         let claude = app_row(&rows, "151.101.1.69");
         let cut = "…are/claude/versions/2.1.296";
         assert_eq!(cut.chars().count(), 28);
-        assert_eq!(col(claude, cut), col(header, "APP"));
-        // 28 cells of path, a gap, the sparkline's four cells and a gap.
-        assert_eq!(col(header, "PID") - col(header, "APP"), 34, "{header}");
+        assert!(pid_before_path(claude, "4312 +2", cut), "{claude}");
+        assert_eq!(end(header, "PID") + 1, col(header, "APP"), "{header}");
     }
 
     #[test]
     fn app_traffic_overview_shows_the_first_pid_and_how_many_more() {
         let rows = traffic_text(&path_state(), &mut Interaction::default());
         let header = app_row(&rows, "DESTINATION");
-        let pid = col(header, "PID");
+        let pid = end(header, "PID");
         let single = app_row(&rows, "142.250.80.46");
         let shared = app_row(&rows, "151.101.1.69");
-        assert_eq!(col(single, "4312"), pid, "{single}");
+        assert_eq!(end(single, "4312"), pid, "{single}");
         assert!(!single.contains("+"), "{single}");
-        assert_eq!(col(shared, "4312 +2"), pid, "{shared}");
-        assert_eq!(col(shared, "151.101.1.69"), col(header, "DESTINATION"));
+        assert_eq!(end(shared, "4312 +2"), pid, "{shared}");
+        // DESTINATION is flush right: the address ends where its header does.
+        assert_eq!(
+            col(shared, "151.101.1.69") + "151.101.1.69".chars().count(),
+            col(header, "DESTINATION") + "DESTINATION".chars().count()
+        );
+    }
+
+    #[test]
+    fn a_port_and_protocol_give_the_service_it_is_normally_used_for() {
+        use crosswalk::ui::panes::service_name;
+        let name = |port, protocol| service_name(port, protocol);
+        assert_eq!(name(Some(443), Protocol::Tcp), Some("https"));
+        assert_eq!(name(Some(443), Protocol::Udp), Some("quic"));
+        assert_eq!(name(Some(5228), Protocol::Tcp), Some("google-push"));
+        assert_eq!(name(Some(53), Protocol::Tcp), Some("dns"));
+        assert_eq!(name(Some(53), Protocol::Udp), Some("dns"));
+        assert_eq!(name(Some(5228), Protocol::Udp), None);
+        assert_eq!(name(Some(40_000), Protocol::Tcp), None);
+        assert_eq!(name(None, Protocol::Tcp), None);
+    }
+
+    fn service_state() -> AppState {
+        let mut state = bare();
+        let chrome = process("/usr/bin/chrome", 100);
+        for (ip, port) in [
+            ("203.0.113.1", 443),
+            ("203.0.113.2", 5228),
+            ("203.0.113.3", 40_000),
+        ] {
+            packet(
+                &mut state,
+                1,
+                Some(&chrome),
+                ip,
+                port,
+                Direction::Outbound,
+                1_000,
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn app_traffic_overview_names_the_service_after_the_port() {
+        let rows = traffic_text(&service_state(), &mut Interaction::default());
+        let header = app_row(&rows, "DESTINATION");
+        assert_eq!(
+            col(app_row(&rows, "443/tcp"), "https"),
+            col(header, "SERVICE")
+        );
+        let push = app_row(&rows, "5228/tcp");
+        assert_eq!(col(push, "google-push"), col(header, "SERVICE"), "{push}");
+        let unlisted = app_row(&rows, "40000/tcp");
+        assert!(unlisted.contains("40000/tcp  "), "{unlisted}");
+        assert!(!unlisted.contains("https"), "{unlisted}");
+    }
+
+    #[test]
+    fn app_traffic_zoom_rows_name_the_service_after_the_port() {
+        use crosswalk::ui::panes::{app_traffic_zoom_columns, app_traffic_zoom_rows};
+        let columns = app_traffic_zoom_columns();
+        let at = columns.iter().position(|c| c.title == "SERVICE").unwrap();
+        assert_eq!(columns[at - 1].title, "PORT");
+        let rows = app_traffic_zoom_rows(&service_state(), &Theme::default(), "", None);
+        let services: Vec<&str> = rows.iter().map(|r| r.cells[at].text.as_str()).collect();
+        assert_eq!(services, ["https", "google-push", ""]);
+    }
+
+    #[test]
+    fn searching_for_a_service_keeps_only_its_rows() {
+        use crosswalk::ui::panes::{app_traffic_rows, app_traffic_zoom_rows};
+        let theme = Theme::default();
+        let found = app_traffic_rows(&service_state(), &theme, "https", None, None);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].cells[2].text, "203.0.113.1");
+        let found = app_traffic_zoom_rows(&service_state(), &theme, "google-push", None);
+        assert_eq!(found.len(), 1);
     }
 
     #[test]
@@ -7129,12 +7211,12 @@ mod overview {
     }
 
     #[test]
-    fn zoomed_app_traffic_puts_pid_second_after_the_app() {
+    fn zoomed_app_traffic_puts_pid_first_before_the_app() {
         let rows = zoomed_paths(170);
         let header = app_row(&rows, "DESTINATION");
         let order = [
-            "APP",
             "PID",
+            "APP",
             "DESTINATION",
             "PORT",
             "↓ IN",
@@ -7151,10 +7233,14 @@ mod overview {
         let rows = zoomed_paths(170);
         let header = app_row(&rows, "DESTINATION");
         let claude = app_row(&rows, "151.101.1.69");
-        assert_eq!(col(claude, CLAUDE_PATH), col(header, "APP"), "{claude}");
         assert_eq!(
-            col(claude, "4312,4390,4401"),
-            col(header, "PID"),
+            end(claude, "4312,4390,4401") + 1,
+            col(claude, CLAUDE_PATH),
+            "{claude}"
+        );
+        assert_eq!(
+            end(claude, "4312,4390,4401"),
+            end(header, "PID"),
             "{claude}"
         );
     }
@@ -7180,11 +7266,11 @@ mod overview {
         let cell: String = claude
             .chars()
             .skip(col(header, "APP"))
-            .take(col(header, "PID") - col(header, "APP") - 6)
+            .take(col(header, "DESTINATION") - col(header, "APP"))
             .collect();
-        let cell = cell.trim_end();
+        let cell = cell.trim_matches(|c| c == '│' || c == ' ');
         assert!(cell.starts_with('…'), "{claude}");
-        assert!(cell.ends_with("versions/2.1.296"), "{claude}");
+        assert!(cell.ends_with("1.296"), "{claude}");
     }
 
     #[test]
@@ -7377,14 +7463,21 @@ mod overview {
         // Wide enough for every column: all are there.
         assert!(all.iter().all(|c| header_at(110).contains(c)));
         // Narrower by one cell than the titled columns need (the sparkline is
-        // already gone): only PID goes.
-        let need = columns
-            .iter()
-            .filter(|c| !c.title.is_empty())
-            .map(|c| c.min_width)
-            .sum::<u16>()
-            + 6;
-        let header = header_at(need - 1);
+        // already gone): only SERVICE goes.
+        let need_with = |service: bool| {
+            let shown: Vec<_> = columns
+                .iter()
+                .filter(|c| !c.title.is_empty() && (service || c.title != "SERVICE"))
+                .collect();
+            shown.iter().map(|c| c.min_width).sum::<u16>() + shown.len() as u16 - 1
+        };
+        let header = header_at(need_with(true) - 1);
+        for column in all {
+            assert!(header.contains(column), "{column}: {header}");
+        }
+        assert!(!header.contains("SERVICE"), "{header}");
+        // Narrower by one more cell than the rest need: PID goes next.
+        let header = header_at(need_with(false) - 1);
         for column in all.into_iter().filter(|c| *c != "PID") {
             assert!(header.contains(column), "{column}: {header}");
         }
@@ -7416,7 +7509,8 @@ mod overview {
             })
             .unwrap();
         let text = lines(&terminal);
-        let x = col(&text[0], "PID") - 5;
+        // The sparkline ends one space before the ↓ IN column, ten cells wide.
+        let x = col(&text[0], "↓ IN") - 7 - 4;
         let buffer = terminal.backend().buffer();
         let cells = (0..4)
             .map(|k| {
@@ -7425,6 +7519,74 @@ mod overview {
             })
             .collect();
         (text[0].clone(), cells)
+    }
+
+    /// The first row's sparkline cells of Traffic's overview drawn `width`
+    /// cells wide: everything between `SERVICE` and `↓ IN`.
+    fn spark_span(state: &AppState, width: u16) -> Vec<char> {
+        use crosswalk::ui::{
+            panes::{app_traffic_columns, app_traffic_rows},
+            table::Table,
+        };
+        let theme = Theme::default();
+        let columns = app_traffic_columns();
+        let rows = app_traffic_rows(state, &theme, "", None, None);
+        let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                Table::new(&columns, &rows, &theme).render(frame.buffer_mut(), area);
+            })
+            .unwrap();
+        let text = lines(&terminal);
+        let (from, to) = (col(&text[0], "SERVICE") + 12, col(&text[0], "↓ IN") - 7);
+        text[1].chars().skip(from).take(to - from).collect()
+    }
+
+    fn burst_thirty_seconds_ago() -> AppState {
+        let mut state = spark_app(&[(20, Direction::Inbound, 100)]);
+        state.advance_time(Duration::from_secs(50));
+        state
+    }
+
+    #[test]
+    fn the_overview_sparkline_fills_the_room_between_service_and_in() {
+        let span = spark_span(&burst_thirty_seconds_ago(), 130);
+        // 130 less two border-free gaps and the other columns leaves 30 or more cells.
+        assert!(span.len() > 20 && span.len() < 60, "{}", span.len());
+        let burst: Vec<usize> = (0..span.len()).filter(|&n| is_braille(span[n])).collect();
+        assert_eq!(burst, vec![span.len() - 1 - 15], "{span:?}");
+    }
+
+    #[test]
+    fn a_pane_wider_than_sixty_sparkline_cells_leaves_the_rest_blank_at_the_left() {
+        let span = spark_span(&burst_thirty_seconds_ago(), 220);
+        assert!(span.len() > 60, "{}", span.len());
+        let burst: Vec<usize> = (0..span.len()).filter(|&n| is_braille(span[n])).collect();
+        assert_eq!(burst, vec![span.len() - 1 - 15], "{span:?}");
+    }
+
+    #[test]
+    fn zoom_draws_a_four_cell_sparkline_after_service() {
+        use crosswalk::ui::panes::{app_traffic_zoom_columns, app_traffic_zoom_rows};
+        use crosswalk::ui::table::Table;
+        let state = spark_app(&[(23, Direction::Inbound, 100)]);
+        let (theme, columns) = (Theme::default(), app_traffic_zoom_columns());
+        let rows = app_traffic_zoom_rows(&state, &theme, "", None);
+        let mut terminal = Terminal::new(TestBackend::new(170, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                Table::new(&columns, &rows, &theme).render(frame.buffer_mut(), area);
+            })
+            .unwrap();
+        let text = lines(&terminal);
+        let from = col(&text[0], "SERVICE") + 12;
+        let cells: String = text[1].chars().skip(from).take(5).collect();
+        assert!(is_braille(cells.chars().nth(3).unwrap()), "{cells:?}");
+        assert!(cells.chars().take(3).all(|c| c == ' '), "{cells:?}");
+        assert_eq!(cells.chars().nth(4), Some(' '));
+        assert!(col(&text[0], "↓ IN") - 7 - from == 4, "{}", text[0]);
     }
 
     fn spark(cells: &[(String, ratatui::style::Color)]) -> String {
@@ -7456,12 +7618,13 @@ mod overview {
     fn the_header_has_an_empty_title_after_app_and_no_history() {
         let state = spark_app(&[(20, Direction::Inbound, 100)]);
         let (header, _) = spark_cells(&state, None, 110, 0);
-        // Left to right, with only the empty sparkline title between APP and PID.
+        // Left to right, with nothing but blanks between PID and APP.
         let titles = [
-            "APP",
             "PID",
+            "APP",
             "DESTINATION",
             "PORT",
+            "SERVICE",
             "↓ IN",
             "↑ OUT",
             "TOTAL",
@@ -7478,7 +7641,7 @@ mod overview {
         );
         assert!(!header.contains("HISTORY"));
         assert!(
-            header[col(&header, "APP") + 3..col(&header, "PID")]
+            header[end(&header, "PID")..col(&header, "APP")]
                 .trim()
                 .is_empty()
         );
@@ -7599,7 +7762,7 @@ mod overview {
             .filter(|l| l.chars().any(is_braille))
             .collect();
         assert!(!rows.is_empty(), "{zoomed:?}");
-        assert!(rows.iter().all(|l| !l.starts_with("│  ")), "{rows:?}");
+        assert!(rows.iter().all(|l| l.contains('/')), "{rows:?}");
     }
 
     // ---- Selection and scrolling on the overview ----
@@ -10226,14 +10389,14 @@ mod theme_cycling {
 
 #[test]
 fn the_terminal_title_names_the_page_or_the_map() {
-    assert_eq!(terminal_title(Page::Traffic, false), "Crosswalk: Traffic");
+    assert_eq!(terminal_title(Page::Traffic, false), "crosswalk: traffic");
     assert_eq!(
         terminal_title(Page::NetworkFirewall, false),
-        "Crosswalk: Network & Firewall"
+        "crosswalk: network & firewall"
     );
-    assert_eq!(terminal_title(Page::Traffic, true), "Crosswalk: Map");
+    assert_eq!(terminal_title(Page::Traffic, true), "crosswalk: map");
     assert_eq!(
         terminal_title(Page::NetworkFirewall, true),
-        "Crosswalk: Map"
+        "crosswalk: map"
     );
 }

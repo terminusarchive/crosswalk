@@ -127,7 +127,7 @@ pub struct DestinationTraffic {
 pub struct AppTraffic {
     pub executable: ExecutableIdentity,
     pub destinations: Vec<DestinationTraffic>,
-    /// The last eight seconds of all the app's destinations, oldest first, ending with the current second.
+    /// The last two minutes of all the app's destinations, oldest first, ending with the current second.
     pub history: [ByteTotals; HISTORY_SECONDS],
 }
 
@@ -185,8 +185,8 @@ const REFUSAL_WINDOW: Duration = Duration::from_secs(2);
 const MAX_PENDING_REQUESTS: usize = 64;
 pub const DEFAULT_EPHEMERAL_PORTS: RangeInclusive<u16> = 32_768..=60_999;
 
-/// Seconds of per-destination bytes kept for App Traffic's HISTORY column.
-pub const HISTORY_SECONDS: usize = 8;
+/// Seconds of per-app bytes kept for App Traffic's sparkline.
+pub const HISTORY_SECONDS: usize = 120;
 
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 const REMOVE_AFTER: Duration = Duration::from_secs(300);
@@ -197,15 +197,26 @@ struct Destination {
     remote: Endpoint,
     protocol: Protocol,
     bytes: ByteTotals,
+    /// The newest second this destination has bytes for.
     second: u64,
-    /// Bytes of the last `HISTORY_SECONDS` seconds up to `second`, slot `s % 8` for second `s`.
-    recent: [ByteTotals; HISTORY_SECONDS],
+    /// The bytes of `second`.
+    current: ByteTotals,
     last_seen: Duration,
     pids: Vec<u32>,
 }
 
-impl Destination {
-    /// The bytes of one second, empty when it is later than `second` or eight or more seconds before it.
+struct App {
+    executable: ExecutableIdentity,
+    destinations: Vec<Destination>,
+    /// The newest second this app has bytes for.
+    second: u64,
+    /// Bytes of the last `HISTORY_SECONDS` seconds up to `second`, slot `s % HISTORY_SECONDS` for second `s`.
+    /// Kept on the app so a destination leaving the list takes none of it.
+    recent: [ByteTotals; HISTORY_SECONDS],
+}
+
+impl App {
+    /// The bytes of one second, empty when it is later than `second` or `HISTORY_SECONDS` or more seconds before it.
     fn bytes_in(&self, s: u64) -> ByteTotals {
         if s <= self.second && self.second - s < HISTORY_SECONDS as u64 {
             self.recent[s as usize % HISTORY_SECONDS]
@@ -213,11 +224,19 @@ impl Destination {
             ByteTotals::default()
         }
     }
-}
 
-struct App {
-    executable: ExecutableIdentity,
-    destinations: Vec<Destination>,
+    /// Count bytes in second `s`; a second older than the history is dropped.
+    fn add_bytes(&mut self, s: u64, direction: Direction, bytes: u64) {
+        if s > self.second {
+            for cleared in (self.second + 1..=s).take(HISTORY_SECONDS) {
+                self.recent[cleared as usize % HISTORY_SECONDS] = ByteTotals::default();
+            }
+            self.second = s;
+        }
+        if self.second - s < HISTORY_SECONDS as u64 {
+            self.recent[s as usize % HISTORY_SECONDS].add(direction, bytes);
+        }
+    }
 }
 
 /// Most access points remembered; listed ones are never forgotten, so a list
@@ -461,6 +480,8 @@ impl AppState {
                     self.apps.push(App {
                         executable,
                         destinations: Vec::new(),
+                        second: at.as_secs(),
+                        recent: [ByteTotals::default(); HISTORY_SECONDS],
                     });
                     self.apps.len() - 1
                 });
@@ -469,24 +490,21 @@ impl AppState {
                     protocol: traffic.protocol,
                     bytes: ByteTotals::default(),
                     second: at.as_secs(),
-                    recent: [ByteTotals::default(); HISTORY_SECONDS],
+                    current: ByteTotals::default(),
                     last_seen: at,
                     pids: Vec::new(),
                 });
                 (i, self.apps[i].destinations.len() - 1)
             }
         };
+        self.apps[i].add_bytes(at.as_secs(), traffic.direction, bytes);
         let destination = &mut self.apps[i].destinations[j];
         destination.bytes.add(traffic.direction, bytes);
         if at.as_secs() > destination.second {
-            let first = destination.second + 1;
-            for s in (first..=at.as_secs()).take(HISTORY_SECONDS) {
-                destination.recent[s as usize % HISTORY_SECONDS] = ByteTotals::default();
-            }
             destination.second = at.as_secs();
+            destination.current = ByteTotals::default();
         }
-        destination.recent[destination.second as usize % HISTORY_SECONDS]
-            .add(traffic.direction, bytes);
+        destination.current.add(traffic.direction, bytes);
         destination.last_seen = destination.last_seen.max(at);
         if !destination.pids.contains(&process.pid) {
             destination.pids.push(process.pid);
@@ -925,21 +943,19 @@ impl AppState {
                 executable: app.executable.clone(),
                 history: std::array::from_fn(|i| {
                     let second = (now_second + 1 + i as u64).wrapping_sub(HISTORY_SECONDS as u64);
-                    let mut sum = ByteTotals::default();
-                    for d in &app.destinations {
-                        let t = d.bytes_in(second);
-                        sum.download = sum.download.saturating_add(t.download);
-                        sum.upload = sum.upload.saturating_add(t.upload);
-                    }
-                    sum
+                    app.bytes_in(second)
                 }),
                 destinations: app
                     .destinations
                     .iter()
                     .map(|d| {
-                        // The rate shows `d.second` while it is current, else nothing at `now`.
+                        // The rate shows `d.second` while it is current, else nothing.
                         let current = now_second.saturating_sub(d.second) <= 1;
-                        let second = d.bytes_in(if current { d.second } else { now_second });
+                        let second = if current {
+                            d.current
+                        } else {
+                            ByteTotals::default()
+                        };
                         DestinationTraffic {
                             remote: d.remote,
                             protocol: d.protocol,

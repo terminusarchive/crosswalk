@@ -61,6 +61,61 @@ fn port_text(port: Option<u16>, protocol: Protocol) -> String {
     format!("{port}/{}", protocol_name(protocol))
 }
 
+/// What a remote port is normally used for, from a short hand-chosen table:
+/// the official registry's names for many ports say nothing. A port listed
+/// without a protocol covers both TCP and UDP. None for any other port, for
+/// no port, and for a protocol that is neither.
+pub fn service_name(port: Option<u16>, protocol: Protocol) -> Option<&'static str> {
+    let tcp = protocol == Protocol::Tcp;
+    let udp = protocol == Protocol::Udp;
+    let name = match port? {
+        20 | 21 if tcp => "ftp",
+        22 if tcp => "ssh",
+        25 | 465 | 587 if tcp => "smtp",
+        53 if tcp || udp => "dns",
+        67 | 68 if udp => "dhcp",
+        80 if tcp => "http",
+        110 if tcp => "pop3",
+        123 if udp => "ntp",
+        137 | 138 if udp => "netbios",
+        139 if tcp => "netbios",
+        143 if tcp => "imap",
+        443 if tcp => "https",
+        443 if udp => "quic",
+        445 if tcp => "smb",
+        631 if tcp || udp => "ipp",
+        853 if tcp || udp => "dns-tls",
+        993 if tcp => "imaps",
+        995 if tcp => "pop3s",
+        1194 if tcp || udp => "openvpn",
+        1883 | 8883 if tcp => "mqtt",
+        1900 if udp => "ssdp",
+        2049 if tcp || udp => "nfs",
+        3306 if tcp => "mysql",
+        3389 if tcp || udp => "rdp",
+        3478 if tcp || udp => "stun",
+        5060 if tcp || udp => "sip",
+        5222 if tcp => "xmpp",
+        5228 if tcp => "google-push",
+        5353 if udp => "mdns",
+        5355 if tcp || udp => "llmnr",
+        5432 if tcp => "postgres",
+        5900 if tcp => "vnc",
+        6379 if tcp => "redis",
+        8080 if tcp => "http-alt",
+        8443 if tcp => "https-alt",
+        9418 if tcp => "git",
+        27017 if tcp => "mongodb",
+        51820 if udp => "wireguard",
+        _ => return None,
+    };
+    Some(name)
+}
+
+fn service_text(port: Option<u16>, protocol: Protocol) -> String {
+    service_name(port, protocol).unwrap_or("").to_owned()
+}
+
 /// Folders that only group releases, so they never name an app.
 const GENERIC_FOLDERS: [&str; 4] = ["versions", "version", "releases", "bin"];
 
@@ -103,37 +158,64 @@ const PATH_ZOOM_MAX: u16 = 48;
 
 pub fn app_traffic_columns() -> Vec<Column> {
     vec![
-        Column::new("APP", Align::Left, 7, 7)
+        Column::new("PID", Align::Right, 5, 2),
+        Column::new("APP", Align::Left, 7, 8)
             .at_most(PATH_MAX)
             .cut_from_left(),
-        spark_column(),
-        Column::new("PID", Align::Left, 5, 1),
-        Column::new("DESTINATION", Align::Left, 13, 6).fill(1),
-        Column::new("PORT", Align::Left, 9, 5).at_least(9),
-        Column::new("↓ IN", Align::Right, 10, 4).at_least(10),
-        Column::new("↑ OUT", Align::Right, 10, 3).at_least(10),
-        Column::new("TOTAL", Align::Right, 8, 2).at_least(8),
+        Column::new("DESTINATION", Align::Right, 13, 7).fill(1),
+        Column::new("PORT", Align::Left, 9, 6).at_least(9),
+        Column::new("SERVICE", Align::Left, 11, 1).at_least(11),
+        spark_fill_column(),
+        Column::new("↓ IN", Align::Right, 10, 5).at_least(10),
+        Column::new("↑ OUT", Align::Right, 10, 4).at_least(10),
+        Column::new("TOTAL", Align::Right, 8, 3).at_least(8),
     ]
 }
 
-/// The app's last eight seconds, four braille cells, dropped before any other column.
-fn spark_column() -> Column {
-    let width = HISTORY_SECONDS as u16 / 2;
-    Column::new("", Align::Left, width, 0)
-        .at_least(width)
-        .at_most(width)
+/// The sparkline column: it drops before any other column when the pane is
+/// narrow, and its cells draw themselves to whatever width the table gives it.
+fn spark_column(align: Align) -> Column {
+    Column::new("", align, SPARK_MIN, 0)
 }
 
-/// Four braille cells, two seconds to a cell, oldest at the left: the left
-/// dots are the older second, the right the newer. A second's height is its
-/// bytes against the busiest of the eight, one to four dots from the bottom
-/// and none for no bytes. A cell is blank when both seconds are, else in the
-/// colour of the larger direction over the two.
-fn spark_cell(theme: &Theme, history: &[ByteTotals; HISTORY_SECONDS]) -> Cell {
+/// The overview's sparkline takes the room the destination leaves, up to the
+/// whole two minutes; the rest stays blank at its left.
+fn spark_fill_column() -> Column {
+    spark_column(Align::Right)
+        .fill(2)
+        .at_most(HISTORY_SECONDS as u16 / 2)
+}
+
+/// Zoom's sparkline is four cells, the last eight seconds.
+fn spark_zoom_column() -> Column {
+    spark_column(Align::Left)
+        .at_least(SPARK_MIN)
+        .at_most(SPARK_MIN)
+}
+
+/// The fewest cells a sparkline is drawn in.
+const SPARK_MIN: u16 = 4;
+
+/// Braille cells, two seconds to a cell, newest at the right: the left dots
+/// are the older second, the right the newer. As many cells as the column has,
+/// up to the whole history, so the cells show the newest `2 * width` seconds.
+/// A second's height is its bytes against the busiest second drawn, one to
+/// four dots from the bottom and none for no bytes. A cell is blank when both
+/// seconds are, else in the colour of the larger direction over the two.
+fn spark_cell(theme: &Theme, history: &[ByteTotals]) -> Cell {
+    let (inbound, outbound) = (theme.inbound, theme.outbound);
+    let history = history.to_vec();
+    Cell::sized(move |width| {
+        let seconds = history.len().min(usize::from(width) * 2);
+        spark(inbound, outbound, &history[history.len() - seconds..])
+    })
+}
+
+fn spark(inbound: Color, outbound: Color, shown: &[ByteTotals]) -> (String, Vec<Style>) {
     const LEFT: [u32; 4] = [0x40, 0x04, 0x02, 0x01];
     const RIGHT: [u32; 4] = [0x80, 0x20, 0x10, 0x08];
     let sum = |t: &ByteTotals| t.upload.saturating_add(t.download);
-    let peak = history.iter().map(sum).max().unwrap_or(0);
+    let peak = shown.iter().map(sum).max().unwrap_or(0);
     let dots = |t: &ByteTotals, bits: [u32; 4]| -> u32 {
         match sum(t) {
             0 => 0,
@@ -143,16 +225,16 @@ fn spark_cell(theme: &Theme, history: &[ByteTotals; HISTORY_SECONDS]) -> Cell {
             }
         }
     };
-    let (glyphs, styles) = history
+    shown
         .chunks(2)
         .map(|pair| {
-            let bits = dots(&pair[0], LEFT) + dots(&pair[1], RIGHT);
-            let download = pair[0].download.saturating_add(pair[1].download);
-            let upload = pair[0].upload.saturating_add(pair[1].upload);
+            let bits = dots(&pair[0], LEFT) + pair.get(1).map_or(0, |t| dots(t, RIGHT));
+            let download = pair.iter().fold(0u64, |n, t| n.saturating_add(t.download));
+            let upload = pair.iter().fold(0u64, |n, t| n.saturating_add(t.upload));
             let colour = if download >= upload {
-                theme.inbound
+                inbound
             } else {
-                theme.outbound
+                outbound
             };
             let glyph = if bits == 0 {
                 ' '
@@ -161,8 +243,7 @@ fn spark_cell(theme: &Theme, history: &[ByteTotals; HISTORY_SECONDS]) -> Cell {
             };
             (glyph, Style::default().fg(colour))
         })
-        .unzip::<_, _, String, Vec<Style>>();
-    Cell::new(glyphs).glyph_styles(styles)
+        .unzip()
 }
 
 /// The app as App Traffic shows it: the executable's full path cut from the
@@ -205,6 +286,7 @@ fn matching<'a>(
                     d.remote.ip.to_string(),
                     name_of(names, d.remote.ip).unwrap_or("").to_owned(),
                     port_text(d.remote.port, d.protocol),
+                    service_text(d.remote.port, d.protocol),
                 ]
                 .iter()
                 .any(|text| text.to_lowercase().contains(needle))
@@ -214,7 +296,7 @@ fn matching<'a>(
 
 /// One row per destination in first-seen order. With `limit`, an app's
 /// destinations past it become one `+N more` row carrying their sums.
-/// `search` keeps destinations whose app, address, name or port contains it.
+/// `search` keeps destinations whose app, address, name, port or service contains it.
 /// A destination with a known reverse-DNS name shows the name.
 pub fn app_traffic_rows(
     state: &AppState,
@@ -235,15 +317,18 @@ pub fn app_traffic_rows(
                 name_of(names, d.remote.ip).map_or_else(|| d.remote.ip.to_string(), bound_text);
             let mut row = traffic_row(
                 theme,
-                label,
                 &pid_text(&d.pids),
+                label,
                 &destination,
-                &port_text(d.remote.port, d.protocol),
+                (
+                    &port_text(d.remote.port, d.protocol),
+                    &service_text(d.remote.port, d.protocol),
+                ),
                 (d.rate, d.bytes),
                 d.idle,
             );
             if n == 0 {
-                row.cells[1] = spark_cell(theme, &app.history);
+                row.cells[5] = spark_cell(theme, &app.history);
             }
             rows.push(row);
         }
@@ -263,11 +348,11 @@ pub fn app_traffic_rows(
                 "",
                 "",
                 &format!("+{} more", rest.len()),
-                "",
+                ("", ""),
                 (rate, bytes),
                 idle,
             );
-            row.cells[3].style = Some(theme.muted());
+            row.cells[2].style = Some(theme.muted());
             rows.push(row);
         }
     }
@@ -276,18 +361,19 @@ pub fn app_traffic_rows(
 
 pub fn app_traffic_zoom_columns() -> Vec<Column> {
     vec![
-        Column::new("APP", Align::Left, 6, 10)
+        Column::new("PID", Align::Right, 5, 5),
+        Column::new("APP", Align::Left, 6, 11)
             .at_most(PATH_ZOOM_MAX)
             .cut_from_left(),
-        spark_column(),
-        Column::new("PID", Align::Left, 5, 4),
-        Column::new("DESTINATION", Align::Left, 15, 9),
-        Column::new("PORT", Align::Left, 8, 8).at_least(9),
-        Column::new("↓ IN", Align::Right, 10, 7).at_least(10),
-        Column::new("↑ OUT", Align::Right, 10, 6).at_least(10),
-        Column::new("↓ TOTAL", Align::Right, 9, 5).at_least(8),
-        Column::new("↑ TOTAL", Align::Right, 9, 3).at_least(8),
-        Column::new("NAME", Align::Left, 10, 2).fill(1),
+        Column::new("DESTINATION", Align::Left, 15, 10),
+        Column::new("PORT", Align::Left, 8, 9).at_least(9),
+        Column::new("SERVICE", Align::Left, 11, 1).at_least(11),
+        spark_zoom_column(),
+        Column::new("↓ IN", Align::Right, 10, 8).at_least(10),
+        Column::new("↑ OUT", Align::Right, 10, 7).at_least(10),
+        Column::new("↓ TOTAL", Align::Right, 9, 6).at_least(8),
+        Column::new("↑ TOTAL", Align::Right, 9, 4).at_least(8),
+        Column::new("NAME", Align::Left, 10, 3).fill(1),
     ]
 }
 
@@ -314,15 +400,16 @@ pub fn app_traffic_zoom_rows(
                 .collect::<Vec<_>>()
                 .join(",");
             let mut row = Row::new([
-                if n == 0 { name.clone() } else { String::new() },
-                String::new(),
                 if pids.is_empty() {
                     "—".to_owned()
                 } else {
                     pids
                 },
+                if n == 0 { name.clone() } else { String::new() },
                 d.remote.ip.to_string(),
                 port_text(d.remote.port, d.protocol),
+                service_text(d.remote.port, d.protocol),
+                String::new(),
                 format_rate(d.rate.download),
                 format_rate(d.rate.upload),
                 format_bytes(d.bytes.download),
@@ -330,12 +417,12 @@ pub fn app_traffic_zoom_rows(
                 name_of(names, d.remote.ip).map_or(String::new(), bound_text),
             ]);
             if n == 0 {
-                row.cells[1] = spark_cell(theme, &app.history);
+                row.cells[5] = spark_cell(theme, &app.history);
             }
             if d.idle {
                 row = row.style(theme.muted());
             } else {
-                style_rate_cells(&mut row, theme, 5, d.rate.download, d.rate.upload);
+                style_rate_cells(&mut row, theme, 6, d.rate.download, d.rate.upload);
             }
             rows.push(row);
         }
@@ -360,19 +447,20 @@ fn style_rate_cells(row: &mut Row, theme: &Theme, first: usize, download: f64, u
 
 fn traffic_row(
     theme: &Theme,
-    app: &str,
     pid: &str,
+    app: &str,
     destination: &str,
-    port: &str,
+    (port, service): (&str, &str),
     (rate, bytes): (ByteRates, ByteTotals),
     idle: bool,
 ) -> Row {
     let mut row = Row::new([
-        app.to_owned(),
-        String::new(),
         pid.to_owned(),
+        app.to_owned(),
         destination.to_owned(),
         port.to_owned(),
+        service.to_owned(),
+        String::new(),
         format_rate(rate.download),
         format_rate(rate.upload),
         format_bytes(bytes.upload.saturating_add(bytes.download)),
@@ -380,7 +468,7 @@ fn traffic_row(
     if idle {
         return row.style(theme.muted());
     }
-    style_rate_cells(&mut row, theme, 5, rate.download, rate.upload);
+    style_rate_cells(&mut row, theme, 6, rate.download, rate.upload);
     row
 }
 

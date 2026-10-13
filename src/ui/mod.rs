@@ -20,7 +20,7 @@ fn page_name(page: Page) -> &'static str {
 /// The terminal title for the view on screen: the open map, else the page.
 pub fn terminal_title(page: Page, map_open: bool) -> String {
     let view = if map_open { "Map" } else { page_name(page) };
-    format!("Crosswalk: {view}")
+    format!("crosswalk: {}", view.to_lowercase())
 }
 
 use chart::Chart;

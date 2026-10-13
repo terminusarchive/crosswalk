@@ -1,5 +1,7 @@
 //! The one table renderer shared by the overview panes and zoom.
 
+use std::{fmt, rc::Rc};
+
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 
 use super::Theme;
@@ -90,12 +92,28 @@ impl Column {
     }
 }
 
+/// A cell's text and a style for each of its characters, drawn for a column
+/// of the given width.
+type Drawing = (String, Vec<Style>);
+
+/// What draws a cell once its column's width is settled.
+#[derive(Clone)]
+struct Sized(Rc<dyn Fn(u16) -> Drawing>);
+
+impl fmt::Debug for Sized {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Sized")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Cell {
     pub text: String,
     pub style: Option<Style>,
     /// A style for each character of the text, over the cell's own.
     pub glyph_styles: Vec<Style>,
+    /// Draws the cell to its column's width, in place of `text`.
+    sized: Option<Sized>,
 }
 
 impl Cell {
@@ -104,6 +122,15 @@ impl Cell {
             text: text.into(),
             style: None,
             glyph_styles: Vec::new(),
+            sized: None,
+        }
+    }
+
+    /// A cell drawn by `draw` to the width its column is given, never wider.
+    pub fn sized(draw: impl Fn(u16) -> (String, Vec<Style>) + 'static) -> Self {
+        Self {
+            sized: Some(Sized(Rc::new(draw))),
+            ..Self::default()
         }
     }
 
@@ -234,7 +261,7 @@ impl<'a> Table<'a> {
             buf,
             (area.x, area.y),
             (&kept, &widths),
-            |i| (self.columns[i].title.as_str(), None, &[]),
+            |i, _| (self.columns[i].title.clone(), None, Vec::new()),
             self.theme.table_header(),
         );
         for (n, row) in rows.iter().skip(scroll).take(body).enumerate() {
@@ -248,10 +275,16 @@ impl<'a> Table<'a> {
                 buf,
                 (area.x, y),
                 (&kept, &widths),
-                |i| {
-                    row.cells.get(i).map_or(("", None, &[][..]), |c| {
-                        (c.text.as_str(), c.style, c.glyph_styles.as_slice())
-                    })
+                |i, width| {
+                    row.cells
+                        .get(i)
+                        .map_or((String::new(), None, Vec::new()), |c| {
+                            let (text, glyphs) = match &c.sized {
+                                Some(Sized(draw)) => draw(width),
+                                None => (c.text.clone(), c.glyph_styles.clone()),
+                            };
+                            (text, c.style, glyphs)
+                        })
                 },
                 style,
             );
@@ -367,24 +400,24 @@ impl<'a> Table<'a> {
         kept.iter().skip(1).map(|&i| 1 + self.columns[i].lead).sum()
     }
 
-    fn draw_line<'t>(
+    fn draw_line(
         &self,
         buf: &mut Buffer,
         (x0, y): (u16, u16),
         (kept, widths): (&[usize], &[u16]),
-        cell: impl Fn(usize) -> (&'t str, Option<Style>, &'t [Style]),
+        cell: impl Fn(usize, u16) -> (String, Option<Style>, Vec<Style>),
         style: Style,
     ) {
         let mut x = x0;
         for (k, &i) in kept.iter().enumerate() {
             let w = widths[k] as usize;
-            let (text, own, glyphs) = cell(i);
+            let (text, own, glyphs) = cell(i, widths[k]);
             let text = if self.columns[i].cut_left {
-                cut_left(text, w as u16)
+                cut_left(&text, w as u16)
             } else if self.columns[i].cut_middle {
-                cut_middle(text, w)
+                cut_middle(&text, w)
             } else {
-                fit(text, w)
+                fit(&text, w)
             };
             let pad = w - text.chars().count();
             let text = match self.columns[i].align {
@@ -392,8 +425,12 @@ impl<'a> Table<'a> {
                 Align::Right => format!("{}{text}", " ".repeat(pad)),
             };
             buf.set_stringn(x, y, &text, w, style.patch(own.unwrap_or_default()));
+            let start = match self.columns[i].align {
+                Align::Left => 0,
+                Align::Right => pad,
+            };
             for (n, glyph) in glyphs.iter().take(w).enumerate() {
-                buf.set_style(Rect::new(x + n as u16, y, 1, 1), *glyph);
+                buf.set_style(Rect::new(x + (start + n) as u16, y, 1, 1), *glyph);
             }
             let next_lead = kept.get(k + 1).map_or(0, |&n| self.columns[n].lead);
             x += widths[k] + 1 + next_lead;
