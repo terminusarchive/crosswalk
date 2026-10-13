@@ -21,7 +21,7 @@ use crosswalk::{
         firewalld_reply::{ActiveZone, PortRule, Target},
     },
     state::{AppState, Page, Pane, StateLimits},
-    ui::{Overview, Theme, draw},
+    ui::{Overview, Theme, draw, terminal_title},
 };
 use crosswalk::{
     dns::ReverseDns,
@@ -10222,4 +10222,18 @@ mod theme_cycling {
             press(&mut i, &state, KeyCode::Char('t'));
         }
     }
+}
+
+#[test]
+fn the_terminal_title_names_the_page_or_the_map() {
+    assert_eq!(terminal_title(Page::Traffic, false), "Crosswalk: Traffic");
+    assert_eq!(
+        terminal_title(Page::NetworkFirewall, false),
+        "Crosswalk: Network & Firewall"
+    );
+    assert_eq!(terminal_title(Page::Traffic, true), "Crosswalk: Map");
+    assert_eq!(
+        terminal_title(Page::NetworkFirewall, true),
+        "Crosswalk: Map"
+    );
 }

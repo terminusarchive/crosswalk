@@ -708,7 +708,12 @@ impl Drop for TerminalSession {
 }
 
 fn restore_terminal() {
-    let _ = execute!(std::io::stdout(), LeaveAlternateScreen, cursor::Show);
+    let _ = execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        cursor::Show,
+        terminal::SetTitle("")
+    );
     let _ = terminal::disable_raw_mode();
 }
 

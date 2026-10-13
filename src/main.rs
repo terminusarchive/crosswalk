@@ -3,7 +3,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::{
+    event::{self, Event, KeyEventKind},
+    execute,
+    terminal::SetTitle,
+};
 use crosswalk::{
     attribution_log::AttributionLog,
     capture_source::{CaptureChoice, choose_capture_source},
@@ -15,7 +19,7 @@ use crosswalk::{
     },
     runtime::{LiveWorkers, MAX_EVENTS_PER_FRAME, TerminalSession, event_channel},
     state::{AppState, StateLimits},
-    ui::{Interaction, draw_interactive},
+    ui::{Interaction, draw_interactive, terminal_title},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
@@ -78,6 +82,7 @@ fn run(config: Config, origin: CaptureOrigin) -> io::Result<()> {
     dns.set_enabled(config.reverse_dns);
     let mut names_on = config.reverse_dns;
     let started = Instant::now();
+    let mut title = String::new();
 
     while !interaction.should_quit() {
         pump.drain(&mut state, MAX_EVENTS_PER_FRAME);
@@ -93,6 +98,11 @@ fn run(config: Config, origin: CaptureOrigin) -> io::Result<()> {
         dns.schedule_visible(interaction.blocked_sources_to_look_up(&state, size.height));
         dns.schedule_visible(interaction.neighbors_to_look_up(&state, size.height));
         dns.schedule_visible(interaction.map_to_look_up(&state));
+        let wanted = terminal_title(interaction.focus().page(), interaction.map_open());
+        if wanted != title {
+            execute!(io::stdout(), SetTitle(&wanted))?;
+            title = wanted;
+        }
         terminal.draw(|frame| {
             draw_interactive(frame, &state, &config.theme, &mut interaction, Some(&dns))
         })?;

@@ -10,6 +10,19 @@ mod zone_rows;
 pub use input::Interaction;
 pub use theme::Theme;
 
+fn page_name(page: Page) -> &'static str {
+    match page {
+        Page::Traffic => "Traffic",
+        Page::NetworkFirewall => "Network & Firewall",
+    }
+}
+
+/// The terminal title for the view on screen: the open map, else the page.
+pub fn terminal_title(page: Page, map_open: bool) -> String {
+    let view = if map_open { "Map" } else { page_name(page) };
+    format!("Crosswalk: {view}")
+}
+
 use chart::Chart;
 use table::{Column, Rendered, Row, Table};
 
@@ -411,9 +424,12 @@ fn draw_header(
     };
     let mut left = vec![
         Span::raw(" "),
-        Span::styled("Traffic", shown(Page::Traffic)),
+        Span::styled(page_name(Page::Traffic), shown(Page::Traffic)),
         Span::styled(" · ", theme.muted()),
-        Span::styled("Network & Firewall", shown(Page::NetworkFirewall)),
+        Span::styled(
+            page_name(Page::NetworkFirewall),
+            shown(Page::NetworkFirewall),
+        ),
     ];
     if page == Page::Traffic && view.new_blocks > 0 {
         let count = if view.new_blocks > 99 {
