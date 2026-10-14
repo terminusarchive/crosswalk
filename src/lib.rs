@@ -3,6 +3,7 @@ pub mod capture_source;
 pub mod collect;
 mod command;
 pub mod config;
+pub mod desktop;
 pub mod dns;
 pub mod events;
 pub mod firewall;

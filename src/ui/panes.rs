@@ -1,12 +1,12 @@
 //! Turns state into what the panes draw: table columns and rows, health
 //! sentences and the header indicators.
 
-use std::{net::IpAddr, time::Duration};
+use std::{collections::HashSet, net::IpAddr, time::Duration};
 
 use ratatui::style::{Color, Style};
 
 use super::{
-    Theme, bound_text,
+    Overview, Theme, bound_text,
     format::{format_bytes, format_count, format_rate},
     table::{Align, Cell, Column, Row, cut_left, filter_rows},
     whole_text,
@@ -20,6 +20,7 @@ use crate::{
         interfaces::CollectionHealth,
         neighbors::Neighbor,
     },
+    desktop::DesktopNames,
     dns::ReverseDns,
     events::{EventKind, EventLevel},
     firewall::{
@@ -32,9 +33,6 @@ use crate::{
         HISTORY_SECONDS, ListeningPort, Pane, WifiEntry, WifiScan,
     },
 };
-
-/// App Traffic shows this many destinations per app on the overview.
-pub const OVERVIEW_DESTINATIONS: usize = 3;
 
 /// The interface the chart plots: the chosen one when it exists, otherwise
 /// the default route, otherwise the first interface.
@@ -151,18 +149,19 @@ const APP_MAX: u16 = 24;
 const IFACE_MAX: u16 = 16;
 const RULE_MAX: u16 = 30;
 const REMOTE_MAX: u16 = 43;
-/// App Traffic shows an app's full path, up to this many cells on the overview.
+/// The most cells App Traffic's APP column takes on the overview, where it
+/// holds a name, cut from the right.
 const PATH_MAX: u16 = 28;
-/// The same on the zoomed list.
-const PATH_ZOOM_MAX: u16 = 48;
+/// The most cells of an app's path the zoomed list shows.
+pub const PATH_ZOOM_MAX: u16 = 48;
 
 pub fn app_traffic_columns() -> Vec<Column> {
     vec![
         Column::new("PID", Align::Right, 5, 2),
-        Column::new("APP", Align::Left, 7, 8)
-            .at_most(PATH_MAX)
-            .cut_from_left(),
-        Column::new("DESTINATION", Align::Right, 13, 7).fill(1),
+        Column::new("APP", Align::Left, 7, 8).at_most(PATH_MAX),
+        Column::new("DESTINATION", Align::Right, 13, 7)
+            .fill(1)
+            .lead(2),
         Column::new("PORT", Align::Left, 9, 6).at_least(9),
         Column::new("SERVICE", Align::Left, 11, 1).at_least(11),
         spark_fill_column(),
@@ -246,14 +245,46 @@ fn spark(inbound: Color, outbound: Color, shown: &[ByteTotals]) -> (String, Vec<
         .unzip()
 }
 
-/// The app as App Traffic shows it: the executable's full path cut from the
-/// left to `width` cells, or its short name when the path names no file.
-fn app_name(app: &AppTraffic, width: u16) -> String {
-    if app.executable.path.file_name().is_some() {
-        cut_left(&whole_text(&app.executable.path.to_string_lossy()), width)
-    } else {
-        file_name(&app.executable)
+/// The app as the overviews show it: the name of its desktop entry, else its
+/// program name.
+fn display_name(executable: &ExecutableIdentity, desktop: Option<&DesktopNames>) -> String {
+    desktop
+        .and_then(|names| names.name(executable))
+        .map_or_else(|| file_name(executable), bound_text)
+}
+
+/// The app as App Traffic shows it: on the zoom the executable's full path cut
+/// from the left to `PATH_ZOOM_MAX` cells, or its short name when the path
+/// names no file; on the overview its display name.
+fn app_name(app: &AppTraffic, zoomed: bool, desktop: Option<&DesktopNames>) -> String {
+    match (zoomed, app.executable.path.file_name()) {
+        (true, Some(_)) => cut_left(
+            &whole_text(&app.executable.path.to_string_lossy()),
+            PATH_ZOOM_MAX,
+        ),
+        (true, None) => file_name(&app.executable),
+        (false, _) => display_name(&app.executable, desktop),
     }
+}
+
+/// What a search matches an app by: its desktop name, its program name and
+/// its full path.
+fn search_texts(executable: &ExecutableIdentity, desktop: Option<&DesktopNames>) -> Vec<String> {
+    desktop
+        .and_then(|names| names.name(executable))
+        .map(bound_text)
+        .into_iter()
+        .chain([
+            file_name(executable),
+            whole_text(&executable.path.to_string_lossy()),
+        ])
+        .collect()
+}
+
+fn mentions(texts: &[String], needle: &str) -> bool {
+    texts
+        .iter()
+        .any(|text| text.to_lowercase().contains(needle))
 }
 
 /// The first process and how many more share the destination, `—` with none.
@@ -270,21 +301,21 @@ fn name_of(names: Option<&ReverseDns>, ip: IpAddr) -> Option<&str> {
     names.and_then(|dns| dns.name(ip))
 }
 
-/// An app's destinations whose app name, address, name or port holds the search.
-fn matching<'a>(
+/// An app's destinations whose app, address, name or port holds the search.
+fn matching<'a, 'n>(
     app: &'a AppTraffic,
-    name: &str,
+    app_texts: &[String],
     needle: &str,
-    names: Option<&ReverseDns>,
+    name_of: &impl Fn(IpAddr) -> Option<&'n str>,
 ) -> Vec<&'a DestinationTraffic> {
     app.destinations
         .iter()
         .filter(|d| {
             needle.is_empty()
+                || mentions(app_texts, needle)
                 || [
-                    name.to_owned(),
                     d.remote.ip.to_string(),
-                    name_of(names, d.remote.ip).unwrap_or("").to_owned(),
+                    name_of(d.remote.ip).unwrap_or("").to_owned(),
                     port_text(d.remote.port, d.protocol),
                     service_text(d.remote.port, d.protocol),
                 ]
@@ -294,69 +325,187 @@ fn matching<'a>(
         .collect()
 }
 
-/// One row per destination in first-seen order. With `limit`, an app's
-/// destinations past it become one `+N more` row carrying their sums.
-/// `search` keeps destinations whose app, address, name, port or service contains it.
-/// A destination with a known reverse-DNS name shows the name.
+/// An app on screen: the destinations of it that match the search, in first-seen order.
+pub struct Shown<'a> {
+    pub app: &'a AppTraffic,
+    pub name: String,
+    pub destinations: Vec<&'a DestinationTraffic>,
+}
+
+impl Shown<'_> {
+    /// The destination with the most bytes in total, the first of equals.
+    fn top(&self) -> &DestinationTraffic {
+        let total = |d: &&DestinationTraffic| d.bytes.upload.saturating_add(d.bytes.download);
+        let mut top = self.destinations[0];
+        for d in &self.destinations[1..] {
+            if total(d) > total(&top) {
+                top = d;
+            }
+        }
+        top
+    }
+
+    /// Whether the app lists its destinations when it is expanded.
+    pub fn expandable(&self) -> bool {
+        self.destinations.len() > 1
+    }
+}
+
+/// One line of App Traffic: an app's, or one of an expanded app's destinations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Line {
+    App(usize),
+    Destination(usize, usize),
+}
+
+/// The apps with a destination matching `search`, named for the zoom or the
+/// overview. `name_of` gives an address its reverse-DNS name, when one is known.
+pub fn shown_apps<'a, 'n>(
+    apps: &'a [AppTraffic],
+    search: &str,
+    zoomed: bool,
+    desktop: Option<&DesktopNames>,
+    name_of: impl Fn(IpAddr) -> Option<&'n str>,
+) -> Vec<Shown<'a>> {
+    let needle = search.to_lowercase();
+    apps.iter()
+        .filter_map(|app| {
+            let name = app_name(app, zoomed, desktop);
+            let texts = search_texts(&app.executable, desktop);
+            let destinations = matching(app, &texts, &needle, &name_of);
+            (!destinations.is_empty()).then_some(Shown {
+                app,
+                name,
+                destinations,
+            })
+        })
+        .collect()
+}
+
+/// The lines in order: each app's, then the destinations of an expanded app.
+pub fn lines(shown: &[Shown<'_>], expanded: &HashSet<ExecutableIdentity>) -> Vec<Line> {
+    let mut lines = Vec::new();
+    for (n, s) in shown.iter().enumerate() {
+        lines.push(Line::App(n));
+        if s.expandable() && expanded.contains(&s.app.executable) {
+            lines.extend((0..s.destinations.len()).map(|d| Line::Destination(n, d)));
+        }
+    }
+    lines
+}
+
+/// The destination cell: the address, with ` +N` after an app's top one in
+/// the highlight colour.
+fn destination_cell(theme: &Theme, address: String, others: usize) -> Cell {
+    if others == 0 {
+        return Cell::new(address);
+    }
+    let suffix = format!(" +{others}");
+    let styles = address
+        .chars()
+        .map(|_| Style::default())
+        .chain(suffix.chars().map(|_| Style::default().fg(theme.highlight)))
+        .collect();
+    Cell::new(address + &suffix).glyph_styles(styles)
+}
+
+/// One line per app on the overview, with the destinations of the expanded
+/// ones beneath. An app's line gives its top destination, ` +N` for the
+/// others, its first process and how many more, and the sums over its
+/// destinations that match `search`; a destination line leaves `APP` and the
+/// sparkline empty. `search` keeps destinations whose app, address, name, port
+/// or service contains it. A destination with a known reverse-DNS name shows
+/// the name.
 pub fn app_traffic_rows(
     state: &AppState,
     theme: &Theme,
     search: &str,
-    limit: Option<usize>,
+    expanded: &HashSet<ExecutableIdentity>,
     names: Option<&ReverseDns>,
+    desktop: Option<&DesktopNames>,
 ) -> Vec<Row> {
-    let needle = search.to_lowercase();
-    let mut rows = Vec::new();
-    for app in state.app_traffic() {
-        let name = app_name(&app, PATH_MAX);
-        let shown = matching(&app, &name, &needle, names);
-        let visible = limit.map_or(shown.len(), |l| l.min(shown.len()));
-        for (n, d) in shown.iter().take(visible).enumerate() {
-            let label = if n == 0 { name.as_str() } else { "" };
-            let destination =
-                name_of(names, d.remote.ip).map_or_else(|| d.remote.ip.to_string(), bound_text);
-            let mut row = traffic_row(
-                theme,
-                &pid_text(&d.pids),
-                label,
-                &destination,
-                (
-                    &port_text(d.remote.port, d.protocol),
-                    &service_text(d.remote.port, d.protocol),
-                ),
-                (d.rate, d.bytes),
-                d.idle,
-            );
-            if n == 0 {
-                row.cells[5] = spark_cell(theme, &app.history);
+    let apps = state.app_traffic();
+    let shown = shown_apps(&apps, search, false, desktop, |ip| name_of(names, ip));
+    let destination = |d: &DestinationTraffic| {
+        name_of(names, d.remote.ip).map_or_else(|| d.remote.ip.to_string(), bound_text)
+    };
+    let row = |pids: &[u32], app: &str, address: String, d: &DestinationTraffic, sum: &Summed| {
+        traffic_row(
+            theme,
+            &pid_text(pids),
+            app,
+            &address,
+            (
+                &port_text(d.remote.port, d.protocol),
+                &service_text(d.remote.port, d.protocol),
+            ),
+            (sum.rate, sum.bytes),
+            sum.idle,
+        )
+    };
+    lines(&shown, expanded)
+        .into_iter()
+        .map(|line| match line {
+            Line::App(n) => {
+                let s = &shown[n];
+                let top = s.top();
+                let sum = Summed::of(&s.destinations);
+                let others = s.destinations.len() - 1;
+                let address = destination(top);
+                let mut row = row(&sum.pids, &s.name, address.clone(), top, &sum);
+                row.cells[2] = destination_cell(theme, address, others);
+                row.cells[5] = spark_cell(theme, &s.app.history);
+                row
             }
-            rows.push(row);
-        }
-        let rest = &shown[visible..];
-        if !rest.is_empty() {
-            let mut rate = ByteRates::default();
-            let mut bytes = ByteTotals::default();
-            for d in rest {
-                rate.upload += d.rate.upload;
-                rate.download += d.rate.download;
-                bytes.upload += d.bytes.upload;
-                bytes.download += d.bytes.download;
+            Line::Destination(n, at) => {
+                let d = shown[n].destinations[at];
+                row(&d.pids, "", destination(d), d, &Summed::of(&[d]))
             }
-            let idle = rest.iter().all(|d| d.idle);
-            let mut row = traffic_row(
-                theme,
-                "",
-                "",
-                &format!("+{} more", rest.len()),
-                ("", ""),
-                (rate, bytes),
-                idle,
-            );
-            row.cells[2].style = Some(theme.muted());
-            rows.push(row);
+        })
+        .collect()
+}
+
+/// What a set of an app's destinations add up to.
+struct Summed {
+    rate: ByteRates,
+    bytes: ByteTotals,
+    idle: bool,
+    /// Every process across them, each once, in first-seen order.
+    pids: Vec<u32>,
+}
+
+impl Summed {
+    fn of(destinations: &[&DestinationTraffic]) -> Self {
+        let mut sum = Self {
+            rate: ByteRates::default(),
+            bytes: ByteTotals::default(),
+            idle: destinations.iter().all(|d| d.idle),
+            pids: Vec::new(),
+        };
+        for d in destinations {
+            sum.rate.upload += d.rate.upload;
+            sum.rate.download += d.rate.download;
+            sum.bytes.upload += d.bytes.upload;
+            sum.bytes.download += d.bytes.download;
+            for pid in &d.pids {
+                if !sum.pids.contains(pid) {
+                    sum.pids.push(*pid);
+                }
+            }
         }
+        sum
     }
-    rows
+}
+
+/// Every process, comma-separated, `—` with none.
+fn pids_text(pids: &[u32]) -> String {
+    if pids.is_empty() {
+        return "—".to_owned();
+    }
+    pids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn app_traffic_zoom_columns() -> Vec<Column> {
@@ -365,7 +514,7 @@ pub fn app_traffic_zoom_columns() -> Vec<Column> {
         Column::new("APP", Align::Left, 6, 11)
             .at_most(PATH_ZOOM_MAX)
             .cut_from_left(),
-        Column::new("DESTINATION", Align::Left, 15, 10),
+        Column::new("DESTINATION", Align::Left, 15, 10).lead(2),
         Column::new("PORT", Align::Left, 8, 9).at_least(9),
         Column::new("SERVICE", Align::Left, 11, 1).at_least(11),
         spark_zoom_column(),
@@ -377,57 +526,58 @@ pub fn app_traffic_zoom_columns() -> Vec<Column> {
     ]
 }
 
-/// Every destination with PID(s), both rates, both totals and the
-/// reverse-DNS name next to the address.
+/// The zoomed lines, as the overview has them: PID(s), both rates and both
+/// totals, and the reverse-DNS name next to the address. An app's line sums
+/// its destinations, and every process across them is listed.
 pub fn app_traffic_zoom_rows(
     state: &AppState,
     theme: &Theme,
     search: &str,
+    expanded: &HashSet<ExecutableIdentity>,
     names: Option<&ReverseDns>,
+    desktop: Option<&DesktopNames>,
 ) -> Vec<Row> {
-    let needle = search.to_lowercase();
-    let mut rows = Vec::new();
-    for app in state.app_traffic() {
-        let name = app_name(&app, PATH_ZOOM_MAX);
-        for (n, d) in matching(&app, &name, &needle, names)
-            .into_iter()
-            .enumerate()
-        {
-            let pids = d
-                .pids
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut row = Row::new([
-                if pids.is_empty() {
-                    "—".to_owned()
-                } else {
-                    pids
-                },
-                if n == 0 { name.clone() } else { String::new() },
-                d.remote.ip.to_string(),
-                port_text(d.remote.port, d.protocol),
-                service_text(d.remote.port, d.protocol),
-                String::new(),
-                format_rate(d.rate.download),
-                format_rate(d.rate.upload),
-                format_bytes(d.bytes.download),
-                format_bytes(d.bytes.upload),
-                name_of(names, d.remote.ip).map_or(String::new(), bound_text),
-            ]);
-            if n == 0 {
-                row.cells[5] = spark_cell(theme, &app.history);
-            }
-            if d.idle {
-                row = row.style(theme.muted());
-            } else {
-                style_rate_cells(&mut row, theme, 6, d.rate.download, d.rate.upload);
-            }
-            rows.push(row);
+    let apps = state.app_traffic();
+    let shown = shown_apps(&apps, search, true, desktop, |ip| name_of(names, ip));
+    let row = |app: &str, d: &DestinationTraffic, sum: &Summed| {
+        let mut row = Row::new([
+            pids_text(&sum.pids),
+            app.to_owned(),
+            d.remote.ip.to_string(),
+            port_text(d.remote.port, d.protocol),
+            service_text(d.remote.port, d.protocol),
+            String::new(),
+            format_rate(sum.rate.download),
+            format_rate(sum.rate.upload),
+            format_bytes(sum.bytes.download),
+            format_bytes(sum.bytes.upload),
+            name_of(names, d.remote.ip).map_or(String::new(), bound_text),
+        ]);
+        if sum.idle {
+            row = row.style(theme.muted());
+        } else {
+            style_rate_cells(&mut row, theme, 6, sum.rate.download, sum.rate.upload);
         }
-    }
-    rows
+        row
+    };
+    lines(&shown, expanded)
+        .into_iter()
+        .map(|line| match line {
+            Line::App(n) => {
+                let s = &shown[n];
+                let top = s.top();
+                let mut row = row(&s.name, top, &Summed::of(&s.destinations));
+                row.cells[2] =
+                    destination_cell(theme, top.remote.ip.to_string(), s.destinations.len() - 1);
+                row.cells[5] = spark_cell(theme, &s.app.history);
+                row
+            }
+            Line::Destination(n, at) => {
+                let d = shown[n].destinations[at];
+                row("", d, &Summed::of(&[d]))
+            }
+        })
+        .collect()
 }
 
 /// A live rate in its direction's colour; zero is muted so live numbers stand out.
@@ -722,15 +872,20 @@ fn by_exposure(mut ports: Vec<ListeningPort>) -> Vec<ListeningPort> {
     ports
 }
 
-fn first_app(p: &ListeningPort) -> String {
+fn first_app(p: &ListeningPort, desktop: Option<&DesktopNames>) -> String {
     p.listener
         .owners
         .first()
-        .map_or("—".to_owned(), |o| file_name(&o.executable))
+        .map_or("—".to_owned(), |o| display_name(&o.executable, desktop))
 }
 
-pub fn listening_rows(state: &AppState, theme: &Theme, search: &str) -> Vec<Row> {
-    listening_rows_for(state, theme, search, false)
+pub fn listening_rows(
+    state: &AppState,
+    theme: &Theme,
+    search: &str,
+    desktop: Option<&DesktopNames>,
+) -> Vec<Row> {
+    listening_rows_for(state, theme, search, desktop, false)
 }
 
 pub fn listening_zoom_columns() -> Vec<Column> {
@@ -762,47 +917,74 @@ fn rule_text(exposure: &Exposure, snapshot: Option<&RuleSnapshot>) -> String {
     }
 }
 
-/// The zoomed rows add the deciding rule and the full executable path.
-fn listening_rows_for(state: &AppState, theme: &Theme, search: &str, zoom: bool) -> Vec<Row> {
-    let read = state.rule_snapshot().is_some();
-    filter_rows(
-        by_exposure(state.listening_ports())
-            .into_iter()
-            .map(|p| {
-                let (text, style) = if read {
-                    exposure_cell(&p.exposure, theme)
-                } else {
-                    ("· …", theme.muted())
-                };
-                let owner = p.listener.owners.first();
-                let mut cells = vec![
-                    first_app(&p),
-                    owner.map_or("—".to_owned(), |o| o.pid.to_string()),
-                    p.listener.address.to_string(),
-                    port_text(Some(p.listener.port), p.listener.protocol),
-                    text.to_owned(),
-                ];
-                if zoom {
-                    cells.push(if read {
-                        rule_text(&p.exposure, state.rule_snapshot())
-                    } else {
-                        "—".to_owned()
-                    });
-                    cells.push(owner.map_or("—".to_owned(), |o| {
-                        whole_text(&o.executable.path.to_string_lossy())
-                    }));
-                }
-                let mut row = Row::new(cells);
-                row.cells[4].style = Some(style);
-                row
-            })
-            .collect(),
-        search,
-    )
+/// The zoomed rows add the deciding rule and the full executable path. A
+/// search also matches the first owner's program name and path.
+fn listening_rows_for(
+    state: &AppState,
+    theme: &Theme,
+    search: &str,
+    desktop: Option<&DesktopNames>,
+    zoom: bool,
+) -> Vec<Row> {
+    let needle = search.to_lowercase();
+    by_exposure(state.listening_ports())
+        .into_iter()
+        .map(|p| (listening_row(state, theme, &p, desktop, zoom), p))
+        .filter(|(row, p)| {
+            let owner_texts: Vec<String> = p
+                .listener
+                .owners
+                .first()
+                .map_or_else(Vec::new, |o| search_texts(&o.executable, desktop));
+            row.matches(&needle) || mentions(&owner_texts, &needle)
+        })
+        .map(|(row, _)| row)
+        .collect()
 }
 
-pub fn listening_zoom_rows(state: &AppState, theme: &Theme, search: &str) -> Vec<Row> {
-    listening_rows_for(state, theme, search, true)
+fn listening_row(
+    state: &AppState,
+    theme: &Theme,
+    p: &ListeningPort,
+    desktop: Option<&DesktopNames>,
+    zoom: bool,
+) -> Row {
+    let read = state.rule_snapshot().is_some();
+    let (text, style) = if read {
+        exposure_cell(&p.exposure, theme)
+    } else {
+        ("· …", theme.muted())
+    };
+    let owner = p.listener.owners.first();
+    let mut cells = vec![
+        first_app(p, desktop),
+        owner.map_or("—".to_owned(), |o| o.pid.to_string()),
+        p.listener.address.to_string(),
+        port_text(Some(p.listener.port), p.listener.protocol),
+        text.to_owned(),
+    ];
+    if zoom {
+        cells.push(if read {
+            rule_text(&p.exposure, state.rule_snapshot())
+        } else {
+            "—".to_owned()
+        });
+        cells.push(owner.map_or("—".to_owned(), |o| {
+            whole_text(&o.executable.path.to_string_lossy())
+        }));
+    }
+    let mut row = Row::new(cells);
+    row.cells[4].style = Some(style);
+    row
+}
+
+pub fn listening_zoom_rows(
+    state: &AppState,
+    theme: &Theme,
+    search: &str,
+    desktop: Option<&DesktopNames>,
+) -> Vec<Row> {
+    listening_rows_for(state, theme, search, desktop, true)
 }
 
 pub fn interface_columns() -> Vec<Column> {
@@ -855,13 +1037,14 @@ pub fn zoom_table(
     theme: &Theme,
     pane: Pane,
     search: &str,
-    names: Option<&ReverseDns>,
     plotted: Option<&str>,
+    view: &Overview<'_>,
 ) -> (Vec<Column>, Vec<Row>) {
+    let names = view.names;
     match pane {
         Pane::AppTraffic => (
             app_traffic_zoom_columns(),
-            app_traffic_zoom_rows(state, theme, search, names),
+            app_traffic_zoom_rows(state, theme, search, &view.expanded, names, view.desktop),
         ),
         Pane::FirewallBlocks => (
             blocked_zoom_columns(),
@@ -869,7 +1052,7 @@ pub fn zoom_table(
         ),
         Pane::ListeningPorts => (
             listening_zoom_columns(),
-            listening_zoom_rows(state, theme, search),
+            listening_zoom_rows(state, theme, search, view.desktop),
         ),
         Pane::Bandwidth => (
             interface_columns(),

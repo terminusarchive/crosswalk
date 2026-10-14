@@ -13,6 +13,7 @@ use crosswalk::{
     capture_source::{CaptureChoice, choose_capture_source},
     collect::capture::CaptureOrigin,
     config::Config,
+    desktop::{DesktopEnv, DesktopNames, desktop_folders},
     dns::ReverseDns,
     privileges::{
         Capabilities, capabilities_from_status, give_up_everything, take_everything_out_of_effect,
@@ -38,6 +39,35 @@ fn main() {
         eprintln!("crosswalk: {error}");
         std::process::exit(1);
     }
+}
+
+/// An environment variable's value; XDG treats an empty one as unset.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// `XDG_DATA_DIRS` without its relative entries, which XDG calls invalid; `None`
+/// when none is left, so the default applies.
+fn absolute_data_dirs(dirs: &str) -> Option<String> {
+    let absolute: Vec<&str> = dirs.split(':').filter(|dir| dir.starts_with('/')).collect();
+    (!absolute.is_empty()).then(|| absolute.join(":"))
+}
+
+/// The desktop entries installed now, read once from the folders the environment names.
+fn load_desktop_names() -> DesktopNames {
+    let data_home = env_value("XDG_DATA_HOME");
+    let data_dirs = env_value("XDG_DATA_DIRS").and_then(|dirs| absolute_data_dirs(&dirs));
+    let home = env_value("HOME");
+    let sudo_user = env_value("SUDO_USER");
+    let env = DesktopEnv {
+        xdg_data_home: data_home.as_deref(),
+        xdg_data_dirs: data_dirs.as_deref(),
+        home: home.as_deref(),
+        sudo_user: sudo_user.as_deref(),
+    };
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let path = std::env::var("PATH").unwrap_or_default();
+    DesktopNames::load(&desktop_folders(&env, &passwd), &path)
 }
 
 /// What the process was granted. `None` means the capabilities could not be determined;
@@ -74,7 +104,8 @@ fn run(config: Config, origin: CaptureOrigin) -> io::Result<()> {
     let mut state = AppState::new(StateLimits::default())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut interaction = Interaction::with_names(config.reverse_dns)
-        .with_theme(config.theme_name, &config.theme_overrides);
+        .with_theme(config.theme_name, &config.theme_overrides)
+        .with_desktop_names(load_desktop_names());
     let (sender, mut pump) = event_channel();
     let mut workers = LiveWorkers::start(&config, sender, attribution_log, origin);
     give_up_everything().map_err(io::Error::other)?;

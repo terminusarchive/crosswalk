@@ -11,6 +11,8 @@ use super::capture::{Endpoint, Protocol, TrafficEvent};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ExecutableIdentity {
     pub path: PathBuf,
+    /// The app ID of the Flatpak sandbox the process runs in; none outside one.
+    pub flatpak_app: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -636,13 +638,27 @@ fn read_process(
     }
     Ok((
         ProcessIdentity {
-            executable: ExecutableIdentity { path: executable },
+            executable: ExecutableIdentity {
+                path: executable,
+                flatpak_app: flatpak_app(path),
+            },
             pid,
             start_time: first_start_time,
             network_namespace,
         },
         inodes,
     ))
+}
+
+/// The app ID in the `[Application]` section of the sandbox's `.flatpak-info`.
+fn flatpak_app(process: &Path) -> Option<String> {
+    let info = fs::read_to_string(process.join("root/.flatpak-info")).ok()?;
+    info.lines()
+        .skip_while(|line| line.trim() != "[Application]")
+        .skip(1)
+        .take_while(|line| !line.starts_with('['))
+        .find_map(|line| line.strip_prefix("name="))
+        .map(|name| name.trim().to_owned())
 }
 
 fn process_start_time(path: &Path) -> io::Result<u64> {

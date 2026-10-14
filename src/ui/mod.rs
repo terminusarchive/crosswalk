@@ -23,6 +23,10 @@ pub fn terminal_title(page: Page, map_open: bool) -> String {
     format!("crosswalk: {}", view.to_lowercase())
 }
 
+use std::collections::HashSet;
+
+use crate::{collect::attribution::ExecutableIdentity, desktop::DesktopNames};
+
 use chart::Chart;
 use table::{Column, Rendered, Row, Table};
 
@@ -57,6 +61,9 @@ pub struct Overview<'a> {
     help: bool,
     names: Option<&'a ReverseDns>,
     names_on: bool,
+    desktop: Option<&'a DesktopNames>,
+    /// The apps App Traffic lists the destinations of, by executable.
+    expanded: HashSet<ExecutableIdentity>,
     /// The theme now shown, for the header.
     theme_name: &'static str,
     new_blocks: u64,
@@ -85,6 +92,8 @@ impl<'a> Overview<'a> {
             help: false,
             names: None,
             names_on: false,
+            desktop: None,
+            expanded: HashSet::new(),
             theme_name: Theme::NAMES[0],
             new_blocks: 0,
             zoom: None,
@@ -135,9 +144,21 @@ impl<'a> Overview<'a> {
         self
     }
 
+    /// Name apps by their desktop entries.
+    pub fn desktop(mut self, names: &'a DesktopNames) -> Self {
+        self.desktop = Some(names);
+        self
+    }
+
     /// Tell the footer whether names are on.
     pub(crate) fn names_on(mut self, on: bool) -> Self {
         self.names_on = on;
+        self
+    }
+
+    /// App Traffic lists the destinations of these apps.
+    pub fn expanded(mut self, apps: &HashSet<ExecutableIdentity>) -> Self {
+        self.expanded = apps.clone();
         self
     }
 
@@ -241,6 +262,7 @@ pub fn draw_interactive(
     let theme = &interaction.theme_to_draw(theme);
     let new_blocks = interaction.blocks_since_shown(state);
     interaction.refresh_map(state);
+    interaction.note_names(state, dns);
     let mut view = interaction.view(dns, new_blocks);
     if let Some((map, offset)) = interaction.map_scene(state, dns) {
         view = view.map(map, offset);
@@ -365,8 +387,9 @@ fn list_pane<'a>(state: &AppState, theme: &Theme, view: &Overview<'_>, pane: Pan
                 state,
                 theme,
                 search,
-                Some(panes::OVERVIEW_DESTINATIONS),
+                &view.expanded,
                 view.names,
+                view.desktop,
             );
             list.empty = "no outbound traffic yet";
             list.footer = panes::uncounted_line(state);
@@ -394,7 +417,7 @@ fn list_pane<'a>(state: &AppState, theme: &Theme, view: &Overview<'_>, pane: Pan
         }
         Pane::ListeningPorts => {
             list.columns = panes::listening_columns();
-            list.rows = panes::listening_rows(state, theme, search);
+            list.rows = panes::listening_rows(state, theme, search, view.desktop);
             list.empty = "no listening ports";
         }
         Pane::WifiNetworks => {
@@ -541,7 +564,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, theme: &Theme, view: &Overview
             + 3 * hints.len().saturating_sub(1)
     };
     let fits = |hints: &[(&str, &str)]| width(hints) <= usize::from(area.width);
-    let theme_hint = format!("theme ({})", view.theme_name);
+    let theme_hint = view.theme_name.to_string();
     if let Some(at) = hints.iter().position(|(key, _)| *key == "t") {
         let plain = hints[at].1;
         hints[at].1 = &theme_hint;
@@ -612,6 +635,38 @@ fn pane_name(pane: Pane) -> &'static str {
         Pane::WifiNetworks => "WI-FI NETWORKS",
         Pane::Bandwidth => "",
     }
+}
+
+/// An overview title leads with the digit that focuses the pane, in the muted
+/// colour; a zoomed pane has none.
+fn with_number(theme: &Theme, pane: Option<Pane>, mut title: Line<'static>) -> Line<'static> {
+    if let Some(pane) = pane {
+        let number = format!(" {}", input::key_number(pane));
+        title.spans.insert(0, Span::styled(number, theme.muted()));
+    }
+    title
+}
+
+const EXPAND_HINT: &str = "[a] expand entry ";
+
+/// App Traffic's title ends with the key that expands an entry while the pane is
+/// focused; a title with no room for all of it keeps none. `width` is the pane's.
+fn with_expand_hint(
+    theme: &Theme,
+    view: &Overview<'_>,
+    pane: Pane,
+    width: u16,
+    mut title: Line<'static>,
+) -> Line<'static> {
+    let room = width.saturating_sub(2) as usize;
+    if pane != Pane::AppTraffic
+        || view.focus != pane
+        || title.width() + EXPAND_HINT.chars().count() > room
+    {
+        return title;
+    }
+    title.spans.push(Span::styled(EXPAND_HINT, theme.muted()));
+    title
 }
 
 fn pane_title(view: &Overview<'_>, theme: &Theme, pane: Pane, title: &str) -> Line<'static> {
@@ -709,7 +764,17 @@ fn draw_list(
 ) -> Rendered {
     let block = pane_block(
         theme,
-        pane_title(view, theme, pane.pane, pane.title),
+        with_expand_hint(
+            theme,
+            view,
+            pane.pane,
+            area.width,
+            with_number(
+                theme,
+                Some(pane.pane),
+                pane_title(view, theme, pane.pane, pane.title),
+            ),
+        ),
         view.focus == pane.pane,
     );
     let inner = pad(block.inner(area));
@@ -781,6 +846,7 @@ pub fn draw_bandwidth(
         interface.as_deref(),
         view.focus == Pane::Bandwidth,
         area.width,
+        Some(Pane::Bandwidth),
     );
     let inner = pad(block.inner(area));
     frame.render_widget(block, area);
@@ -804,21 +870,27 @@ fn bandwidth_block<'a>(
     interface: Option<&str>,
     focused: bool,
     width: u16,
+    number: Option<Pane>,
 ) -> Block<'a> {
+    let label = "BANDWIDTH";
     let Some(name) = interface else {
         return pane_block(
             theme,
-            pane_title(view, theme, Pane::Bandwidth, "BANDWIDTH"),
+            with_number(
+                theme,
+                number,
+                pane_title(view, theme, Pane::Bandwidth, label),
+            ),
             focused,
         );
     };
     let mut parts = connection_parts(state, name);
     let room = width.saturating_sub(2) as usize;
     loop {
-        let mut title = pane_title(view, theme, Pane::Bandwidth, "BANDWIDTH · ");
+        let mut title = pane_title(view, theme, Pane::Bandwidth, label);
         // After " BANDWIDTH · " comes the name, the parts in the title's own
         // style, then the title's closing space.
-        title.spans[0].content = " BANDWIDTH · ".into();
+        title.spans[0].content = format!(" {label} · ").into();
         let rest = theme.title(focused);
         title
             .spans
@@ -833,8 +905,9 @@ fn bandwidth_block<'a>(
             next += 1;
         }
         title.spans.insert(next, Span::styled(" ", rest));
-        if title.width() <= room || parts.pop().is_none() {
-            return pane_block(theme, title, focused);
+        let numbered_width = with_number(theme, number, title.clone()).width();
+        if numbered_width <= room || parts.pop().is_none() {
+            return pane_block(theme, with_number(theme, number, title), focused);
         }
     }
 }
@@ -902,13 +975,28 @@ fn draw_zoom(
 ) -> Rendered {
     let plotted = panes::chart_interface(state, view.interface);
     let search = view.search_for(pane);
-    let (columns, rows) =
-        panes::zoom_table(state, theme, pane, search, view.names, plotted.as_deref());
+    let (columns, rows) = panes::zoom_table(state, theme, pane, search, plotted.as_deref(), view);
     let block = match pane {
-        Pane::Bandwidth => {
-            bandwidth_block(theme, view, state, plotted.as_deref(), true, area.width)
-        }
-        _ => pane_block(theme, pane_title(view, theme, pane, pane_name(pane)), true),
+        Pane::Bandwidth => bandwidth_block(
+            theme,
+            view,
+            state,
+            plotted.as_deref(),
+            true,
+            area.width,
+            None,
+        ),
+        _ => pane_block(
+            theme,
+            with_expand_hint(
+                theme,
+                view,
+                pane,
+                area.width,
+                pane_title(view, theme, pane, pane_name(pane)),
+            ),
+            true,
+        ),
     };
     let inner = pad(block.inner(area));
     frame.render_widget(block, area);
@@ -994,6 +1082,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
             "i / n / r / m",
             "interface · reverse DNS names · scan Wi-Fi · map",
         ),
+        key("a", "expand or collapse the selected app in App Traffic"),
         key("t", "next theme · T previous"),
         key("? / q / ctrl-c", "toggle this help / quit"),
         Line::from(vec![

@@ -25,6 +25,7 @@ fn process(path: &str, pid: u32) -> ProcessIdentity {
     ProcessIdentity {
         executable: ExecutableIdentity {
             path: PathBuf::from(path),
+            flatpak_app: None,
         },
         pid,
         start_time: u64::from(pid),

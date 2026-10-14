@@ -1,6 +1,10 @@
 //! Key handling: focus, zoom, per-pane search, selection, interface choice and help.
 
-use std::{collections::HashSet, net::IpAddr, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    path::PathBuf,
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Color;
@@ -8,10 +12,14 @@ use ratatui::style::Color;
 use super::{
     Drawn, Overview,
     map::{Map, build, chosen_address},
-    panes,
+    panes::{self, Line},
 };
 use crate::{
-    collect::interfaces::{hardware_address, is_wireless},
+    collect::{
+        attribution::ExecutableIdentity,
+        interfaces::{hardware_address, is_wireless},
+    },
+    desktop::DesktopNames,
     dns::ReverseDns,
     state::{AppState, Page, Pane},
     ui::Theme,
@@ -48,6 +56,11 @@ fn moved(code: KeyCode, control: bool, from: usize, half: usize) -> Option<usize
 
 fn slot(pane: Pane) -> usize {
     VISUAL_ORDER.iter().position(|p| *p == pane).unwrap_or(0)
+}
+
+/// The digit key that focuses `pane`.
+pub fn key_number(pane: Pane) -> usize {
+    slot(pane) + 1
 }
 
 fn page_slot(page: Page) -> usize {
@@ -124,6 +137,12 @@ pub struct Interaction {
     interface: Option<String>,
     help: bool,
     names: bool,
+    /// The apps App Traffic lists the destinations of, by executable.
+    expanded: HashSet<ExecutableIdentity>,
+    desktop: DesktopNames,
+    /// The reverse-DNS names the last draw showed in App Traffic, so a search
+    /// by name finds the same lines here.
+    known_names: HashMap<IpAddr, String>,
     /// Index in `Theme::NAMES` of the theme started with, then of the one `t` last chose.
     theme: usize,
     /// The `[theme]` colours, kept on top of every theme.
@@ -153,6 +172,9 @@ impl Default for Interaction {
             interface: None,
             help: false,
             names: false,
+            expanded: HashSet::new(),
+            desktop: DesktopNames::default(),
+            known_names: HashMap::new(),
             theme: 0,
             overrides: Vec::new(),
             cycled: false,
@@ -221,6 +243,11 @@ impl Interaction {
         self.map.vendor_table = path.into();
         self
     }
+    /// Names apps by these desktop entries.
+    pub fn with_desktop_names(mut self, names: DesktopNames) -> Self {
+        self.desktop = names;
+        self
+    }
     /// Reads this host's hardware address with `reader` instead of from the system.
     pub fn with_host_address(mut self, reader: fn(&str) -> Option<String>) -> Self {
         self.map.host_reader = reader;
@@ -258,6 +285,10 @@ impl Interaction {
     }
     pub fn help_open(&self) -> bool {
         self.help
+    }
+    /// Lists the destinations of these apps, by executable, as well.
+    pub fn expand(&mut self, apps: impl IntoIterator<Item = ExecutableIdentity>) {
+        self.expanded.extend(apps);
     }
     pub fn selected(&self) -> usize {
         self.selected
@@ -354,6 +385,7 @@ impl Interaction {
             KeyCode::Char('/') => self.field_open = true,
             KeyCode::Char('i') => self.next_interface(state),
             KeyCode::Char('n') => self.names = !self.names,
+            KeyCode::Char('a') if self.focus == Pane::AppTraffic => self.toggle_selected_app(state),
             KeyCode::Char('t') => self.step_theme(1),
             KeyCode::Char('T') => self.step_theme(Theme::NAMES.len() - 1),
             KeyCode::Char('r') if self.focus == Pane::WifiNetworks => self.scan_requested = true,
@@ -402,6 +434,50 @@ impl Interaction {
     }
 
     /// Puts the selection back on the first row, to be settled by the next draw.
+    /// Expands or collapses the app on the selected App Traffic line; on one
+    /// of its destinations, collapses its app and selects the app's line.
+    fn toggle_selected_app(&mut self, state: &AppState) {
+        let apps = state.app_traffic();
+        let search = self.search(Pane::AppTraffic);
+        let shown = panes::shown_apps(
+            &apps,
+            search,
+            self.zoom.is_some(),
+            Some(&self.desktop),
+            |ip| self.known_names.get(&ip).map(String::as_str),
+        );
+        let lines = panes::lines(&shown, &self.expanded);
+        let Some(&line) = lines.get(self.selected) else {
+            return;
+        };
+        match line {
+            Line::App(n) if shown[n].expandable() => {
+                let app = shown[n].app.executable.clone();
+                if !self.expanded.remove(&app) {
+                    self.expanded.insert(app);
+                }
+            }
+            Line::App(_) => {}
+            Line::Destination(n, _) => {
+                self.expanded.remove(&shown[n].app.executable);
+                self.selected = lines.iter().position(|l| *l == Line::App(n)).unwrap_or(0);
+            }
+        }
+    }
+
+    /// Remembers the names App Traffic shows, for the keys.
+    pub(super) fn note_names(&mut self, state: &AppState, dns: Option<&ReverseDns>) {
+        self.known_names.clear();
+        let Some(dns) = dns.filter(|_| self.names && self.focus == Pane::AppTraffic) else {
+            return;
+        };
+        for d in state.app_traffic().iter().flat_map(|app| &app.destinations) {
+            if let Some(name) = dns.name(d.remote.ip) {
+                self.known_names.insert(d.remote.ip, name.to_owned());
+            }
+        }
+    }
+
     fn reset_position(&mut self) {
         self.matched = None;
         self.selected = 0;
@@ -537,6 +613,8 @@ impl Interaction {
             .position(self.selected, self.scroll)
             .help(self.help)
             .names_on(self.names)
+            .expanded(&self.expanded)
+            .desktop(&self.desktop)
             .theme_name(self.theme_name())
             .new_blocks(new_blocks);
         if let Some(name) = &self.interface {

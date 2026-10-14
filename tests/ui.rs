@@ -29,11 +29,20 @@ use crosswalk::{
 };
 use ratatui::{Terminal, backend::TestBackend};
 
+/// Every app expanded, so App Traffic lists each destination.
+fn all_expanded(state: &AppState) -> std::collections::HashSet<ExecutableIdentity> {
+    state
+        .app_traffic()
+        .into_iter()
+        .map(|app| app.executable)
+        .collect()
+}
+
 fn press(i: &mut Interaction, state: &AppState, code: KeyCode) {
     i.handle_key(KeyEvent::new(code, KeyModifiers::NONE), state);
 }
 
-/// The Traffic page, App Traffic focused.
+/// The Traffic page, App Traffic focused, every app expanded.
 fn draw_at(state: &AppState, width: u16, height: u16) -> Terminal<TestBackend> {
     draw_focused(state, Pane::AppTraffic, width, height)
 }
@@ -41,7 +50,10 @@ fn draw_at(state: &AppState, width: u16, height: u16) -> Terminal<TestBackend> {
 fn draw_focused(state: &AppState, focus: Pane, width: u16, height: u16) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
-        .draw(|frame| draw(frame, state, &Theme::default(), &Overview::new(focus)))
+        .draw(|frame| {
+            let view = Overview::new(focus).expanded(&all_expanded(state));
+            draw(frame, state, &Theme::default(), &view)
+        })
         .unwrap();
     terminal
 }
@@ -54,6 +66,7 @@ fn screen(
     height: u16,
 ) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    i.expand(all_expanded(state));
     terminal
         .draw(|frame| draw_interactive(frame, state, &Theme::default(), i, dns))
         .unwrap();
@@ -709,6 +722,7 @@ mod overview {
         ProcessIdentity {
             executable: ExecutableIdentity {
                 path: PathBuf::from(path),
+                flatpak_app: None,
             },
             pid,
             start_time: 1,
@@ -967,26 +981,26 @@ mod overview {
     }
 
     const TRAFFIC_TITLES: [&str; 4] = [
-        "BANDWIDTH",
-        "APP TRAFFIC",
-        "LISTENING PORTS",
-        "FIREWALL RULES",
+        "1 BANDWIDTH",
+        "2 APP TRAFFIC",
+        "3 LISTENING PORTS",
+        "4 FIREWALL RULES",
     ];
     const NETWORK_TITLES: [&str; 4] = [
-        "FIREWALL BLOCKS",
-        "NETWORK EVENTS",
-        "NEIGHBORS",
-        "WI-FI NETWORKS",
+        "5 FIREWALL BLOCKS",
+        "6 NETWORK EVENTS",
+        "8 NEIGHBORS",
+        "7 WI-FI NETWORKS",
     ];
 
     #[test]
     fn the_traffic_page_shows_its_four_titles_in_place_and_none_of_the_others() {
         for (width, height) in [(110, 24), (160, 50)] {
             let text = lines(&draw_focused(&sample(), Pane::Bandwidth, width, height));
-            let bandwidth = at(&text, "BANDWIDTH");
-            let apps = at(&text, "APP TRAFFIC");
-            let ports = at(&text, "LISTENING PORTS");
-            let rules = at(&text, "FIREWALL RULES");
+            let bandwidth = at(&text, "1 BANDWIDTH");
+            let apps = at(&text, "2 APP TRAFFIC");
+            let ports = at(&text, "3 LISTENING PORTS");
+            let rules = at(&text, "4 FIREWALL RULES");
             // Bandwidth over App Traffic over a bottom row: Listening Ports on
             // the left, Firewall Rules on the right from the middle.
             assert!(bandwidth.0 < apps.0 && apps.0 < ports.0, "{width}x{height}");
@@ -1021,10 +1035,10 @@ mod overview {
                 width,
                 height,
             ));
-            let blocked = at(&text, "FIREWALL BLOCKS");
-            let rules = at(&text, "NETWORK EVENTS");
-            let neighbors = at(&text, "NEIGHBORS");
-            let wifi = at(&text, "WI-FI NETWORKS");
+            let blocked = at(&text, "5 FIREWALL BLOCKS");
+            let rules = at(&text, "6 NETWORK EVENTS");
+            let neighbors = at(&text, "8 NEIGHBORS");
+            let wifi = at(&text, "7 WI-FI NETWORKS");
             assert_eq!(blocked.1, rules.1, "{width}x{height}");
             assert_eq!(wifi.1, neighbors.1, "{width}x{height}");
             assert!(blocked.1 < wifi.1, "{width}x{height}");
@@ -1047,7 +1061,7 @@ mod overview {
     #[test]
     fn listening_ports_at_the_minimum_size_keep_port_app_and_firewall_whole() {
         let text = lines(&draw_at(&sample(), 110, 24));
-        let (y, x) = at(&text, "LISTENING PORTS");
+        let (y, x) = at(&text, "3 LISTENING PORTS");
         let header = &text[y + 1];
         let pane: String = header.chars().skip(x).collect();
         for column in ["PORT", "APP", "FIREWALL"] {
@@ -1064,7 +1078,7 @@ mod overview {
         }
         // The limited port is the fourth row: more room than the minimum shows it.
         let text = lines(&draw_at(&sample(), 110, 32));
-        let (y, x) = at(&text, "LISTENING PORTS");
+        let (y, x) = at(&text, "3 LISTENING PORTS");
         let joined = text[y + 2..y + 6]
             .iter()
             .map(|r| r.chars().skip(x).collect::<String>())
@@ -1079,7 +1093,7 @@ mod overview {
 
     #[test]
     fn bidi_overrides_and_zero_width_characters_are_stripped_from_app_names() {
-        use crosswalk::ui::panes::app_traffic_rows;
+        use crosswalk::ui::panes::{app_traffic_rows, app_traffic_zoom_rows};
         let mut state = AppState::new(StateLimits::default()).unwrap();
         let app = process("/usr/bin/ev\u{202E}il\u{200B}x\u{2066}\u{FEFF}y", 5);
         packet(
@@ -1091,7 +1105,23 @@ mod overview {
             Direction::Outbound,
             100,
         );
-        let rows = app_traffic_rows(&state, &Theme::default(), "", None, None);
+        let rows = app_traffic_rows(
+            &state,
+            &Theme::default(),
+            "",
+            &Default::default(),
+            None,
+            None,
+        );
+        assert_eq!(rows[0].cells[1].text, "evilxy");
+        let rows = app_traffic_zoom_rows(
+            &state,
+            &Theme::default(),
+            "",
+            &Default::default(),
+            None,
+            None,
+        );
         assert_eq!(rows[0].cells[1].text, "/usr/bin/evilxy");
     }
 
@@ -1126,29 +1156,28 @@ mod overview {
             100,
         );
         let theme = Theme::default();
-        let rows = app_traffic_rows(&state, &theme, "", None, None);
-        // The path is cut from the left to App Traffic's 28 cells.
+        let rows = app_traffic_rows(&state, &theme, "", &all_expanded(&state), None, None);
+        // The overview names the program, bounded.
+        assert!(rows[0].cells[1].text.starts_with("a[31mbcdef"));
+        assert_clean(&rows[0].cells[1].text, Some(48));
+        // The zoom cuts the path from the left to 48 cells.
+        let rows = app_traffic_zoom_rows(&state, &theme, "", &all_expanded(&state), None, None);
         assert!(rows[0].cells[1].text.starts_with('…'));
-        assert!(
-            rows[0].cells[1]
-                .text
-                .ends_with("xxxxxxxxxxxxxxxxxxxxxxxxxxx")
-        );
-        assert_clean(&rows[0].cells[1].text, Some(28));
-        let rows = app_traffic_zoom_rows(&state, &theme, "", None);
         assert_clean(&rows[0].cells[1].text, Some(48));
         state.record_listeners(vec![listener(22, "0.0.0.0", Some(&long))], 32_768..=60_999);
-        let rows = listening_rows(&state, &theme, "");
+        let rows = listening_rows(&state, &theme, "", None);
         assert_clean(&rows[0].cells[1].text, Some(48));
         // The zoom path is whole, but never carries hidden characters.
-        let rows = listening_zoom_rows(&state, &theme, "");
+        let rows = listening_zoom_rows(&state, &theme, "", None);
         assert_clean(&rows[0].cells[6].text, None);
         assert!(rows[0].cells[6].text.contains("a[31mbcdef"));
     }
 
     #[test]
     fn a_version_numbered_executable_is_named_by_its_folder() {
-        use crosswalk::ui::panes::{app_traffic_rows, listening_rows, listening_zoom_rows};
+        use crosswalk::ui::panes::{
+            app_traffic_rows, app_traffic_zoom_rows, listening_rows, listening_zoom_rows,
+        };
         let claude = "/home/u/.local/share/claude/versions/2.1.296";
         let mut state = AppState::new(StateLimits::default()).unwrap();
         for (n, path) in [
@@ -1173,30 +1202,33 @@ mod overview {
             );
         }
         let theme = Theme::default();
-        let names: Vec<String> = app_traffic_rows(&state, &theme, "", None, None)
-            .iter()
-            .map(|r| r.cells[1].text.clone())
-            .filter(|t| !t.is_empty())
-            .collect();
-        // App Traffic shows the path; the short name is for Listening Ports.
+        let names: Vec<String> =
+            app_traffic_rows(&state, &theme, "", &all_expanded(&state), None, None)
+                .iter()
+                .map(|r| r.cells[1].text.clone())
+                .filter(|t| !t.is_empty())
+                .collect();
         assert_eq!(
             names,
-            [
-                "…are/claude/versions/2.1.296",
-                "/usr/bin/emacs-31.1",
-                "/usr/bin/python3.12",
-                "/opt/tool/bin/7",
-                "/1234"
-            ]
+            ["claude", "emacs-31.1", "python3.12", "tool", "1234"]
         );
-        let found = app_traffic_rows(&state, &theme, "claude", None, None);
+        // The zoom shows the path.
+        let zoom: Vec<String> =
+            app_traffic_zoom_rows(&state, &theme, "", &all_expanded(&state), None, None)
+                .iter()
+                .map(|r| r.cells[1].text.clone())
+                .filter(|t| !t.is_empty())
+                .collect();
+        assert_eq!(zoom[0], claude);
+        assert_eq!(zoom[4], "/1234");
+        let found = app_traffic_rows(&state, &theme, "claude", &all_expanded(&state), None, None);
         assert_eq!(found.len(), 1);
         assert!(found[0].cells[1].text.contains("claude"));
 
         state.record_listeners(vec![listener(22, "0.0.0.0", Some(claude))], 32_768..=60_999);
-        let rows = listening_rows(&state, &theme, "");
+        let rows = listening_rows(&state, &theme, "", None);
         assert_eq!(rows[0].cells[0].text, "claude");
-        let rows = listening_zoom_rows(&state, &theme, "");
+        let rows = listening_zoom_rows(&state, &theme, "", None);
         assert!(rows[0].cells[6].text.contains("2.1.296"));
     }
 
@@ -1219,7 +1251,7 @@ mod overview {
             default_outgoing: Policy::Allow,
             rules: vec![hostile_rule],
         });
-        let rows = listening_zoom_rows(&state, &Theme::default(), "");
+        let rows = listening_zoom_rows(&state, &Theme::default(), "", None);
         assert!(rows[0].cells[5].text.starts_with("a[31mbcdef"));
         assert_clean(&rows[0].cells[5].text, Some(48));
     }
@@ -1253,10 +1285,11 @@ mod overview {
         }
         assert!(dns.name(ip).is_some(), "lookup never finished");
         let theme = Theme::default();
-        let rows = app_traffic_rows(&state, &theme, "", None, Some(&dns));
+        let rows = app_traffic_rows(&state, &theme, "", &all_expanded(&state), Some(&dns), None);
         assert!(rows[0].cells[2].text.starts_with("a[31mbcdef"));
         assert_clean(&rows[0].cells[2].text, Some(48));
-        let rows = app_traffic_zoom_rows(&state, &theme, "", Some(&dns));
+        let rows =
+            app_traffic_zoom_rows(&state, &theme, "", &all_expanded(&state), Some(&dns), None);
         assert!(rows[0].cells[10].text.starts_with("a[31mbcdef"));
         assert_clean(&rows[0].cells[10].text, Some(48));
     }
@@ -1284,15 +1317,15 @@ mod overview {
         for (focus, titles) in [
             (
                 Pane::AppTraffic,
-                vec!["APP TRAFFIC", "LISTENING PORTS", "FIREWALL RULES"],
+                vec!["2 APP TRAFFIC", "3 LISTENING PORTS", "4 FIREWALL RULES"],
             ),
             (
                 Pane::FirewallBlocks,
                 vec![
-                    "FIREWALL BLOCKS",
-                    "NETWORK EVENTS",
-                    "NEIGHBORS",
-                    "WI-FI NETWORKS",
+                    "5 FIREWALL BLOCKS",
+                    "6 NETWORK EVENTS",
+                    "8 NEIGHBORS",
+                    "7 WI-FI NETWORKS",
                 ],
             ),
         ] {
@@ -1401,7 +1434,7 @@ mod overview {
             .find(|&y| rows[y].chars().nth(left) == Some('╰'))
             .expect("the popup's bottom border is on screen");
         assert!(rows[top..bottom].iter().any(|l| l.contains("● open")));
-        assert!(bottom - top < 17, "the popup is {} rows", bottom - top + 1);
+        assert!(bottom - top < 18, "the popup is {} rows", bottom - top + 1);
     }
 
     #[test]
@@ -1481,9 +1514,9 @@ mod overview {
         };
         for height in [24u16, 26, 32, 40, 50] {
             let text = lines(&draw_at(&sample(), 110, height));
-            let apps = height_of(&text, "APP TRAFFIC");
-            let ports = height_of(&text, "LISTENING PORTS");
-            let rules = height_of(&text, "FIREWALL RULES");
+            let apps = height_of(&text, "2 APP TRAFFIC");
+            let ports = height_of(&text, "3 LISTENING PORTS");
+            let rules = height_of(&text, "4 FIREWALL RULES");
             assert_eq!(ports, rules, "110x{height}");
             assert!(ports >= 7, "110x{height}: bottom row is {ports} high");
             assert!(apps >= ports, "110x{height}: {apps} against {ports}");
@@ -1496,7 +1529,7 @@ mod overview {
     #[test]
     fn listening_ports_in_its_half_shows_four_rows_with_every_column_whole_at_110_by_24() {
         let text = lines(&draw_at(&sample(), 110, 24));
-        let (y, x) = at(&text, "LISTENING PORTS");
+        let (y, x) = at(&text, "3 LISTENING PORTS");
         let half = |line: &String| -> String { line.chars().skip(x).take(53).collect() };
         let header = half(&text[y + 1]);
         for column in ["PORT", "APP", "BIND", "FIREWALL"] {
@@ -1516,7 +1549,7 @@ mod overview {
     #[test]
     fn network_events_is_titled_and_quiet_on_the_overview_and_in_zoom() {
         let text = lines(&draw_net(&sample(), 110, 24));
-        let (y, x) = at(&text, "NETWORK EVENTS");
+        let (y, x) = at(&text, "6 NETWORK EVENTS");
         assert!(
             text[y + 1]
                 .chars()
@@ -1816,24 +1849,41 @@ mod overview {
     }
 
     #[test]
-    fn an_app_with_five_destinations_shows_three_and_the_rest_summed() {
-        let text = lines(&draw_at(&sample(), 160, 50)).join("\n");
-        assert!(text.contains("+2 more"), "{text}");
-        assert!(text.contains("142.250.80.46") && text.contains("104.18.32.7"));
-        assert!(!text.contains("93.184.216.34"), "fourth destination listed");
-        // The app name is printed on its first row only.
-        assert_eq!(
-            text.matches("/usr/lib/firefox/firefox").count(),
-            1,
-            "{text}"
-        );
+    fn an_app_with_five_destinations_is_one_line_until_it_is_expanded() {
+        let state = sample();
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &state,
+                    &Theme::default(),
+                    &Overview::new(Pane::AppTraffic),
+                )
+            })
+            .unwrap();
+        let text = lines(&terminal).join("\n");
+        assert!(text.contains("2606:4700::6810:84e5 +4"), "{text}");
+        assert!(!text.contains("more"), "{text}");
+        assert!(!text.contains("142.250.80.46"), "{text}");
         assert!(text.contains("syncthing"));
+        let text = lines(&draw_at(&state, 160, 50)).join("\n");
+        for address in [
+            "142.250.80.46",
+            "151.101.1.69",
+            "104.18.32.7",
+            "93.184.216.34",
+        ] {
+            assert!(text.contains(address), "{address}\n{text}");
+        }
+        // The app name is printed on its line only.
+        assert_eq!(text.matches("firefox").count(), 1, "{text}");
     }
 
     #[test]
     fn no_cell_shows_a_raw_byte_count_a_path_or_debug_formatting() {
         for (width, height) in [(110, 24), (160, 50)] {
-            // App Traffic shows an app's path; its rows carry a rate.
+            // App Traffic names its apps; its rows carry a rate.
             let pages = all_pages(&sample(), width, height);
             let text = pages
                 .lines()
@@ -1962,6 +2012,102 @@ mod overview {
     }
 
     #[test]
+    fn the_pane_number_is_muted_and_the_title_keeps_its_style_focused_or_not() {
+        let theme = Theme::default();
+        for focused in [false, true] {
+            let focus = if focused {
+                Pane::Bandwidth
+            } else {
+                Pane::AppTraffic
+            };
+            let terminal = bandwidth_screen(focus, &sample());
+            let text = lines(&terminal);
+            let (y, x) = at(&text, "1 BANDWIDTH");
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(x as u16, y as u16)].style().fg, theme.muted().fg);
+            let letter = buffer[(x as u16 + 2, y as u16)].style();
+            assert_eq!(letter.fg, theme.title(focused).fg);
+            assert_eq!(letter.add_modifier, theme.title(focused).add_modifier);
+        }
+    }
+
+    const EXPAND_HINT: &str = "[a] expand entry";
+
+    fn hint_muted(terminal: &Terminal<TestBackend>) -> bool {
+        let (y, x) = at(&lines(terminal), EXPAND_HINT);
+        let buffer = terminal.backend().buffer();
+        (x..x + EXPAND_HINT.chars().count())
+            .all(|x| buffer[(x as u16, y as u16)].style().fg == Theme::default().muted().fg)
+    }
+
+    #[test]
+    fn app_traffic_names_the_expand_key_in_its_title_while_focused() {
+        let terminal = draw_focused(&sample(), Pane::AppTraffic, 160, 50);
+        let text = lines(&terminal);
+        let (y, _) = at(&text, "2 APP TRAFFIC");
+        assert!(
+            text[y].contains("2 APP TRAFFIC [a] expand entry"),
+            "{}",
+            text[y]
+        );
+        assert!(hint_muted(&terminal));
+    }
+
+    #[test]
+    fn the_expand_hint_comes_after_the_search() {
+        let state = sample();
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        let view = Overview::new(Pane::AppTraffic).search(Pane::AppTraffic, "syncthing");
+        terminal
+            .draw(|frame| draw(frame, &state, &Theme::default(), &view))
+            .unwrap();
+        let text = lines(&terminal);
+        let (y, _) = at(&text, "APP TRAFFIC");
+        assert!(
+            text[y].contains("/syncthing [a] expand entry"),
+            "{}",
+            text[y]
+        );
+    }
+
+    #[test]
+    fn another_focused_pane_hides_the_expand_hint() {
+        let text = text_of(&draw_focused(&sample(), Pane::Bandwidth, 160, 50));
+        assert!(!text.contains(EXPAND_HINT), "{text}");
+    }
+
+    #[test]
+    fn a_zoomed_app_traffic_shows_the_expand_hint_and_another_zoom_does_not() {
+        let state = sample();
+        let mut i = Interaction::default();
+        press(&mut i, &state, KeyCode::Char('2'));
+        press(&mut i, &state, KeyCode::Enter);
+        let terminal = screen(&state, &mut i, None, 160, 50);
+        let (y, _) = at(&lines(&terminal), "APP TRAFFIC");
+        assert!(lines(&terminal)[y].contains("APP TRAFFIC [a] expand entry"));
+        assert!(hint_muted(&terminal));
+        let mut other = Interaction::default();
+        press(&mut other, &state, KeyCode::Char('3'));
+        press(&mut other, &state, KeyCode::Enter);
+        let text = text_of(&screen(&state, &mut other, None, 160, 50));
+        assert!(!text.contains(EXPAND_HINT));
+    }
+
+    #[test]
+    fn a_title_too_narrow_for_the_expand_hint_leaves_it_out_whole() {
+        let state = sample();
+        let mut terminal = Terminal::new(TestBackend::new(110, 50)).unwrap();
+        let search = "x".repeat(80);
+        let view = Overview::new(Pane::AppTraffic).search(Pane::AppTraffic, &search);
+        terminal
+            .draw(|frame| draw(frame, &state, &Theme::default(), &view))
+            .unwrap();
+        let text = text_of(&terminal);
+        assert!(text.contains("APP TRAFFIC /xxxx"), "{text}");
+        assert!(!text.contains("[a]") && !text.contains("expand"), "{text}");
+    }
+
+    #[test]
     fn overriding_highlight_changes_the_interface_name_colour_and_inbound_does_not() {
         let name_colour = |theme: &Theme| {
             let terminal = bandwidth_screen_in(Pane::AppTraffic, &sample(), theme);
@@ -2087,7 +2233,14 @@ mod overview {
             text.contains("not attributed: 3.0 KB in, 40 B out"),
             "{text}"
         );
-        let rows = crosswalk::ui::panes::app_traffic_zoom_rows(&state, &Theme::default(), "", None);
+        let rows = crosswalk::ui::panes::app_traffic_zoom_rows(
+            &state,
+            &Theme::default(),
+            "",
+            &all_expanded(&state),
+            None,
+            None,
+        );
         assert_eq!(rows.len(), 1);
         assert!(
             rows[0]
@@ -2154,7 +2307,7 @@ mod overview {
         let mut state = AppState::new(StateLimits::default()).unwrap();
         healthy(&mut state);
         state.record_listeners(vec![listener(4000, "0.0.0.0", None)], 32_768..=60_999);
-        let rows = crosswalk::ui::panes::listening_rows(&state, &Theme::default(), "");
+        let rows = crosswalk::ui::panes::listening_rows(&state, &Theme::default(), "", None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cells[1].text, "—");
         assert!(rows[0].cells.iter().all(|c| !c.text.contains("unknown")));
@@ -2165,14 +2318,18 @@ mod overview {
         let terminal = draw_at(&sample(), 110, 24);
         let text = lines(&terminal);
         let theme = Theme::default();
-        let (y, x) = at(&text, "APP TRAFFIC");
+        let (y, x) = at(&text, "2 APP TRAFFIC");
         assert_eq!(
-            terminal.backend().buffer()[(x as u16, y as u16)].style().fg,
+            terminal.backend().buffer()[(x as u16 + 2, y as u16)]
+                .style()
+                .fg,
             Some(theme.accent)
         );
-        let (y, x) = at(&text, "LISTENING PORTS");
+        let (y, x) = at(&text, "3 LISTENING PORTS");
         assert_ne!(
-            terminal.backend().buffer()[(x as u16, y as u16)].style().fg,
+            terminal.backend().buffer()[(x as u16 + 2, y as u16)]
+                .style()
+                .fg,
             Some(theme.accent)
         );
     }
@@ -3469,6 +3626,10 @@ mod overview {
     #[test]
     fn app_traffic_zoom_lists_every_destination_with_the_extra_columns() {
         let (_, _, text) = zoomed('2', 132, 32);
+        assert!(
+            !text.contains("2 APP TRAFFIC"),
+            "a zoomed title has no number"
+        );
         for visible in [
             "APP TRAFFIC",
             "PID",
@@ -3670,8 +3831,9 @@ mod overview {
         let mut i = Interaction::default();
         press(&mut i, &state, KeyCode::Char('2'));
         press(&mut i, &state, KeyCode::Enter);
-        press(&mut i, &state, KeyCode::Char('j'));
-        press(&mut i, &state, KeyCode::Char('j'));
+        for _ in 0..3 {
+            press(&mut i, &state, KeyCode::Char('j'));
+        }
         let terminal = screen(&state, &mut i, None, 120, 32);
         let text = lines(&terminal);
         let (y, x) = at(&text, "104.18.32.7");
@@ -3837,8 +3999,8 @@ mod overview {
         for visible in [
             // The popup covers only its own box: the titles outside it stay.
             "Traffic",
-            "BANDWIDTH",
-            "APP TRAFFIC",
+            "1 BANDWIDTH",
+            "2 APP TRAFFIC",
             "HELP",
             "open",
             "limited",
@@ -3869,7 +4031,7 @@ mod overview {
             .find(|(_, l)| l.contains("● open"))
             .map(|(n, _)| n)
             .unwrap();
-        assert!(last - top + 2 <= 17, "popup is {} rows", last - top + 2);
+        assert!(last - top + 2 <= 18, "popup is {} rows", last - top + 2);
     }
 
     #[test]
@@ -7043,24 +7205,17 @@ mod overview {
     }
 
     #[test]
-    fn app_traffic_overview_shows_the_path_whole_or_cut_from_the_left_to_28_cells() {
+    fn app_traffic_overview_shows_the_program_name_without_a_desktop_entry() {
         let rows = traffic_text(&path_state(), &mut Interaction::default());
-        assert_eq!(CLAUDE_PATH.chars().count(), 47);
         let header = app_row(&rows, "DESTINATION");
         let firefox = app_row(&rows, "142.250.80.46");
-        assert!(firefox.contains("/usr/lib/firefox/firefox"), "{firefox}");
-        // Every PID ends one space before its app's path.
+        // Every PID ends one space before its app's name.
         let pid_before_path = |row: &str, pid: &str, path: &str| {
             end(row, pid) + 1 == col(row, path) && col(row, path) == col(header, "APP")
         };
-        assert!(
-            pid_before_path(firefox, "4312", "/usr/lib/firefox/firefox"),
-            "{firefox}"
-        );
+        assert!(pid_before_path(firefox, "4312", "firefox"), "{firefox}");
         let claude = app_row(&rows, "151.101.1.69");
-        let cut = "…are/claude/versions/2.1.296";
-        assert_eq!(cut.chars().count(), 28);
-        assert!(pid_before_path(claude, "4312 +2", cut), "{claude}");
+        assert!(pid_before_path(claude, "4312 +2", "claude"), "{claude}");
         assert_eq!(end(header, "PID") + 1, col(header, "APP"), "{header}");
     }
 
@@ -7137,40 +7292,41 @@ mod overview {
         let columns = app_traffic_zoom_columns();
         let at = columns.iter().position(|c| c.title == "SERVICE").unwrap();
         assert_eq!(columns[at - 1].title, "PORT");
-        let rows = app_traffic_zoom_rows(&service_state(), &Theme::default(), "", None);
+        let rows = app_traffic_zoom_rows(
+            &service_state(),
+            &Theme::default(),
+            "",
+            &all_expanded(&service_state()),
+            None,
+            None,
+        );
         let services: Vec<&str> = rows.iter().map(|r| r.cells[at].text.as_str()).collect();
-        assert_eq!(services, ["https", "google-push", ""]);
+        assert_eq!(services, ["https", "https", "google-push", ""]);
     }
 
     #[test]
     fn searching_for_a_service_keeps_only_its_rows() {
         use crosswalk::ui::panes::{app_traffic_rows, app_traffic_zoom_rows};
         let theme = Theme::default();
-        let found = app_traffic_rows(&service_state(), &theme, "https", None, None);
+        let found = app_traffic_rows(
+            &service_state(),
+            &theme,
+            "https",
+            &all_expanded(&service_state()),
+            None,
+            None,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].cells[2].text, "203.0.113.1");
-        let found = app_traffic_zoom_rows(&service_state(), &theme, "google-push", None);
-        assert_eq!(found.len(), 1);
-    }
-
-    #[test]
-    fn the_more_row_has_no_pid_and_only_an_apps_first_row_has_its_path() {
-        let rows = lines(&screen(
-            &path_state(),
-            &mut Interaction::default(),
+        let found = app_traffic_zoom_rows(
+            &service_state(),
+            &theme,
+            "google-push",
+            &all_expanded(&service_state()),
             None,
-            110,
-            50,
-        ));
-        let header = app_row(&rows, "DESTINATION");
-        let more = app_row(&rows, "+5 more");
-        let (pid, dest) = (col(header, "PID"), col(header, "DESTINATION"));
-        let between: String = more.chars().skip(pid).take(dest - pid).collect();
-        assert_eq!(between.trim_matches([' ', '│']), "", "{more}");
-        assert_eq!(
-            rows.iter().filter(|l| l.contains("/usr/bin/many")).count(),
-            1
+            None,
         );
+        assert_eq!(found.len(), 1);
     }
 
     #[test]
@@ -7440,7 +7596,7 @@ mod overview {
         let state = path_state();
         let theme = Theme::default();
         let columns = app_traffic_columns();
-        let rows = app_traffic_rows(&state, &theme, "", None, None);
+        let rows = app_traffic_rows(&state, &theme, "", &all_expanded(&state), None, None);
         let header_at = |width: u16| -> String {
             let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
             terminal
@@ -7490,7 +7646,6 @@ mod overview {
     /// Traffic's overview table drawn `width` cells wide, and the header.
     fn spark_cells(
         state: &AppState,
-        limit: Option<usize>,
         width: u16,
         n: usize,
     ) -> (String, Vec<(String, ratatui::style::Color)>) {
@@ -7500,7 +7655,7 @@ mod overview {
         };
         let theme = Theme::default();
         let columns = app_traffic_columns();
-        let rows = app_traffic_rows(state, &theme, "", limit, None);
+        let rows = app_traffic_rows(state, &theme, "", &all_expanded(state), None, None);
         let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
         terminal
             .draw(|frame| {
@@ -7530,7 +7685,7 @@ mod overview {
         };
         let theme = Theme::default();
         let columns = app_traffic_columns();
-        let rows = app_traffic_rows(state, &theme, "", None, None);
+        let rows = app_traffic_rows(state, &theme, "", &all_expanded(state), None, None);
         let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
         terminal
             .draw(|frame| {
@@ -7572,7 +7727,7 @@ mod overview {
         use crosswalk::ui::table::Table;
         let state = spark_app(&[(23, Direction::Inbound, 100)]);
         let (theme, columns) = (Theme::default(), app_traffic_zoom_columns());
-        let rows = app_traffic_zoom_rows(&state, &theme, "", None);
+        let rows = app_traffic_zoom_rows(&state, &theme, "", &all_expanded(&state), None, None);
         let mut terminal = Terminal::new(TestBackend::new(170, 4)).unwrap();
         terminal
             .draw(|frame| {
@@ -7617,7 +7772,7 @@ mod overview {
     #[test]
     fn the_header_has_an_empty_title_after_app_and_no_history() {
         let state = spark_app(&[(20, Direction::Inbound, 100)]);
-        let (header, _) = spark_cells(&state, None, 110, 0);
+        let (header, _) = spark_cells(&state, 110, 0);
         // Left to right, with nothing but blanks between PID and APP.
         let titles = [
             "PID",
@@ -7658,7 +7813,7 @@ mod overview {
             (22, down, 400),
             (23, down, 800),
         ]);
-        let (_, cells) = spark_cells(&state, None, 110, 0);
+        let (_, cells) = spark_cells(&state, 110, 0);
         assert_eq!(spark(&cells), "  ⣀⣼");
         let inbound = Theme::default().inbound;
         assert!(cells[2..].iter().all(|(_, c)| *c == inbound), "{cells:?}");
@@ -7670,7 +7825,7 @@ mod overview {
         let mut state = spark_app(&[(22, down, 100), (23, down, 400)]);
         let app = process("/usr/bin/spark", 9);
         packet(&mut state, 23, Some(&app), "198.51.100.2", 443, down, 400);
-        let (_, cells) = spark_cells(&state, None, 110, 0);
+        let (_, cells) = spark_cells(&state, 110, 0);
         // The older second is one dot of the left column, the newer all four.
         assert_eq!(spark(&cells), "   ⣸");
     }
@@ -7681,7 +7836,7 @@ mod overview {
             (22, Direction::Outbound, 100),
             (23, Direction::Outbound, 100),
         ]);
-        let (_, cells) = spark_cells(&state, None, 110, 0);
+        let (_, cells) = spark_cells(&state, 110, 0);
         assert_eq!(cells[3].1, Theme::default().outbound);
     }
 
@@ -7689,7 +7844,7 @@ mod overview {
     fn the_busiest_second_is_four_dots_whatever_the_rate() {
         for bytes in [1_000, 100_000_000] {
             let state = spark_app(&[(23, Direction::Inbound, bytes)]);
-            let (_, cells) = spark_cells(&state, None, 110, 0);
+            let (_, cells) = spark_cells(&state, 110, 0);
             let bits = spark(&cells).chars().last().unwrap() as u32 - 0x2800;
             assert_eq!(bits & 0xB8, 0xB8, "{cells:?}");
         }
@@ -7699,12 +7854,12 @@ mod overview {
     fn an_app_idle_for_eight_seconds_shows_four_empty_cells() {
         let mut state = spark_app(&[(20, Direction::Inbound, 100)]);
         state.advance_time(Duration::from_secs(28));
-        let (_, cells) = spark_cells(&state, None, 110, 0);
+        let (_, cells) = spark_cells(&state, 110, 0);
         assert_eq!(spark(&cells), "    ");
     }
 
     #[test]
-    fn later_rows_and_the_more_row_leave_the_sparkline_empty() {
+    fn later_destination_lines_leave_the_sparkline_empty() {
         let mut state = bare();
         let app = process("/usr/bin/many", 700);
         for n in 1..=5 {
@@ -7719,10 +7874,10 @@ mod overview {
                 100,
             );
         }
-        let (_, first) = spark_cells(&state, Some(3), 110, 0);
+        let (_, first) = spark_cells(&state, 110, 0);
         assert_ne!(spark(&first).trim(), "");
-        for n in 1..=3 {
-            let (_, cells) = spark_cells(&state, Some(3), 110, n);
+        for n in 1..=5 {
+            let (_, cells) = spark_cells(&state, 110, n);
             assert_eq!(spark(&cells), "    ", "row {n}");
         }
     }
@@ -7741,7 +7896,7 @@ mod overview {
             .map(|c| c.min_width)
             .sum();
         let theme = Theme::default();
-        let rows = app_traffic_rows(&state, &theme, "", None, None);
+        let rows = app_traffic_rows(&state, &theme, "", &all_expanded(&state), None, None);
         let mut terminal = Terminal::new(TestBackend::new(titled + 6, 4)).unwrap();
         terminal
             .draw(|frame| {
@@ -8079,7 +8234,7 @@ mod overview {
     }
 
     #[test]
-    fn app_traffics_plus_n_more_rows_are_selectable_like_any_other() {
+    fn app_traffics_destination_lines_are_selectable_like_any_other() {
         let state = busy();
         let mut i = Interaction::default();
         press(&mut i, &state, KeyCode::Char('2'));
@@ -8089,7 +8244,11 @@ mod overview {
         let t = view(&state, &mut i);
         let m = marked(&t);
         assert_eq!(m.len(), 1);
-        assert!(line_of(&t, m[0].0).contains("+2 more"), "{}", text_of(&t));
+        assert!(
+            line_of(&t, m[0].0).contains("104.18.32.7"),
+            "{}",
+            text_of(&t)
+        );
         press(&mut i, &state, KeyCode::Char('G'));
         let t = view(&state, &mut i);
         assert!(
@@ -8828,6 +8987,7 @@ mod steady_columns {
         let owner = ProcessIdentity {
             executable: ExecutableIdentity {
                 path: PathBuf::from("/usr/bin/curl"),
+                flatpak_app: None,
             },
             pid: 4_321,
             start_time: 1,
@@ -8954,7 +9114,7 @@ mod steady_columns {
 
     #[test]
     fn app_traffic_titles_hold_still_as_the_numbers_grow() {
-        let quiet = overview(&app_state(&[tcp(443)]));
+        let quiet = overview(&app_state(&[tcp(443), tcp(80)]));
         let busy = overview(&app_state(&[tcp(443), TOP]));
         assert_same(
             &quiet,
@@ -8966,7 +9126,7 @@ mod steady_columns {
 
     #[test]
     fn zoomed_app_traffic_titles_hold_still_as_the_numbers_grow() {
-        let quiet = zoom(&app_state(&[tcp(443)]), '2');
+        let quiet = zoom(&app_state(&[tcp(443), tcp(80)]), '2');
         let busy = zoom(&app_state(&[tcp(443), TOP]), '2');
         assert_same(
             &quiet,
@@ -10076,7 +10236,7 @@ mod map_keys {
         let bottom = (top..rows.len())
             .find(|&y| rows[y].chars().nth(left) == Some('╰'))
             .expect("the popup's bottom border is on screen");
-        assert!(bottom - top < 17, "the popup is {} rows", bottom - top + 1);
+        assert!(bottom - top < 18, "the popup is {} rows", bottom - top + 1);
         for kept in [
             "tab / 1-8",
             "j/k g/G ctrl-d/u",
@@ -10275,17 +10435,21 @@ mod theme_cycling {
     fn the_footer_names_t_on_the_overview_in_zoom_and_on_the_map_but_not_while_typing() {
         let state = state();
         let mut i = Interaction::default();
-        assert!(footer_at(&mut i, &state).contains("t theme"));
+        assert!(has_t_hint(&footer_at(&mut i, &state)));
         press(&mut i, &state, KeyCode::Char('p'));
-        assert!(footer_at(&mut i, &state).contains("t theme"));
+        assert!(has_t_hint(&footer_at(&mut i, &state)));
         press(&mut i, &state, KeyCode::Enter);
-        assert!(footer_at(&mut i, &state).contains("t theme"));
+        assert!(has_t_hint(&footer_at(&mut i, &state)));
         press(&mut i, &state, KeyCode::Esc);
         press(&mut i, &state, KeyCode::Char('m'));
-        assert!(footer_at(&mut i, &state).contains("t theme"));
+        assert!(has_t_hint(&footer_at(&mut i, &state)));
         press(&mut i, &state, KeyCode::Esc);
         press(&mut i, &state, KeyCode::Char('/'));
-        assert!(!footer_at(&mut i, &state).contains("t theme"));
+        assert!(!has_t_hint(&footer_at(&mut i, &state)));
+    }
+
+    fn has_t_hint(footer: &str) -> bool {
+        footer.contains("t theme") || footer.contains("t synthwave")
     }
 
     fn footer_at_width(i: &mut Interaction, state: &AppState, width: u16) -> String {
@@ -10297,24 +10461,22 @@ mod theme_cycling {
         let state = state();
         let mut i = Interaction::default();
         let footer = footer_at_width(&mut i, &state, 130);
-        assert!(footer.contains("t theme (synthwave)"), "{footer:?}");
+        assert!(footer.contains("t synthwave"), "{footer:?}");
         assert!(
-            footer
-                .trim_end()
-                .ends_with("t theme (synthwave) · ? help · q quit"),
+            footer.trim_end().ends_with("t synthwave · ? help · q quit"),
             "{footer:?}"
         );
         press(&mut i, &state, KeyCode::Char('t'));
         let footer = footer_at_width(&mut i, &state, 130);
-        assert!(footer.contains("t theme (dracula)"), "{footer:?}");
+        assert!(footer.contains("t dracula"), "{footer:?}");
         assert!(!footer.contains("synthwave"), "{footer:?}");
         press(&mut i, &state, KeyCode::Enter);
         let footer = footer_at_width(&mut i, &state, 130);
-        assert!(footer.contains("t theme (dracula)"), "zoom: {footer:?}");
+        assert!(footer.contains("t dracula"), "zoom: {footer:?}");
         press(&mut i, &state, KeyCode::Esc);
         press(&mut i, &state, KeyCode::Char('m'));
         let footer = footer_at_width(&mut i, &state, 130);
-        assert!(footer.contains("t theme (dracula)"), "map: {footer:?}");
+        assert!(footer.contains("t dracula"), "map: {footer:?}");
     }
 
     #[test]
@@ -10399,4 +10561,566 @@ fn the_terminal_title_names_the_page_or_the_map() {
         terminal_title(Page::NetworkFirewall, true),
         "crosswalk: map"
     );
+}
+
+mod app_lines {
+    use super::*;
+    use crosswalk::ui::panes::{app_traffic_rows, app_traffic_zoom_rows};
+    use std::collections::HashSet;
+
+    fn owner(path: &str, pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            executable: ExecutableIdentity {
+                path: PathBuf::from(path),
+                flatpak_app: None,
+            },
+            pid,
+            start_time: 1,
+            network_namespace: 7,
+        }
+    }
+
+    fn send(
+        state: &mut AppState,
+        at: u64,
+        app: &ProcessIdentity,
+        remote: &str,
+        port: u16,
+        bytes: u32,
+    ) {
+        let local = Endpoint {
+            ip: "192.0.2.10".parse().unwrap(),
+            port: Some(51_000),
+        };
+        state.record_traffic(
+            Duration::from_secs(at),
+            TrafficEvent {
+                source: local,
+                destination: Endpoint {
+                    ip: remote.parse().unwrap(),
+                    port: Some(port),
+                },
+                protocol: Protocol::Tcp,
+                direction: Direction::Outbound,
+                original_ip_bytes: bytes,
+                limitation: None,
+                tcp_flags: None,
+                timing: None,
+            },
+            Some(app.clone()),
+        );
+    }
+
+    /// chrome (pids 10 and 11) to three destinations, the one with the most
+    /// bytes sent early and the others later; curl (pid 20) to one.
+    fn state() -> AppState {
+        let mut state = AppState::new(StateLimits::default()).unwrap();
+        let (a, b) = (owner("/usr/bin/chrome", 10), owner("/usr/bin/chrome", 11));
+        send(&mut state, 1, &a, "203.0.113.1", 443, 10_000);
+        send(&mut state, 5, &a, "203.0.113.2", 5228, 2_000);
+        send(&mut state, 5, &b, "203.0.113.3", 40_000, 4_000);
+        send(
+            &mut state,
+            5,
+            &owner("/usr/bin/curl", 20),
+            "198.51.100.1",
+            80,
+            500,
+        );
+        state
+    }
+
+    fn expanded(paths: &[&str]) -> HashSet<ExecutableIdentity> {
+        paths
+            .iter()
+            .map(|path| ExecutableIdentity {
+                path: PathBuf::from(path),
+                flatpak_app: None,
+            })
+            .collect()
+    }
+
+    fn column(rows: &[crosswalk::ui::table::Row], at: usize) -> Vec<&str> {
+        rows.iter().map(|r| r.cells[at].text.as_str()).collect()
+    }
+
+    #[test]
+    fn an_app_line_names_the_destination_with_the_most_bytes_and_counts_the_rest() {
+        let state = state();
+        let apps = state.app_traffic();
+        assert!(apps[0].destinations[1].rate.upload > apps[0].destinations[0].rate.upload);
+        let theme = Theme::default();
+        let rows = app_traffic_rows(&state, &theme, "", &expanded(&[]), None, None);
+        assert_eq!(column(&rows, 2), ["203.0.113.1 +2", "198.51.100.1"]);
+        assert_eq!(column(&rows, 3), ["443/tcp", "80/tcp"]);
+        assert_eq!(rows[0].cells[4].text, "https");
+        assert_eq!(rows[0].cells[0].text, "10 +1");
+        assert_eq!(rows[0].cells[8].text, "16.0 KB");
+        let zoom = app_traffic_zoom_rows(&state, &theme, "", &expanded(&[]), None, None);
+        assert_eq!(column(&zoom, 2), ["203.0.113.1 +2", "198.51.100.1"]);
+        assert_eq!(zoom[0].cells[0].text, "10,11");
+    }
+
+    #[test]
+    fn an_expanded_app_is_followed_by_each_of_its_destinations() {
+        let state = state();
+        let theme = Theme::default();
+        let open = expanded(&["/usr/bin/chrome"]);
+        let rows = app_traffic_rows(&state, &theme, "", &open, None, None);
+        assert_eq!(
+            column(&rows, 2),
+            [
+                "203.0.113.1 +2",
+                "203.0.113.1",
+                "203.0.113.2",
+                "203.0.113.3",
+                "198.51.100.1"
+            ]
+        );
+        assert_eq!(column(&rows, 1)[1..4], ["", "", ""]);
+        assert!(rows.iter().all(|r| r.cells[2].text != "+2 more"));
+        let zoom = app_traffic_zoom_rows(&state, &theme, "", &open, None, None);
+        assert_eq!(zoom.len(), 5);
+        assert_eq!(zoom[2].cells[2].text, "203.0.113.2");
+    }
+
+    /// The style of the first character of `needle` in the first body row, and
+    /// of the characters after it, drawn through `Table` 150 cells wide.
+    fn drawn_styles(
+        columns: &[crosswalk::ui::table::Column],
+        rows: &[crosswalk::ui::table::Row],
+        needle: &str,
+    ) -> (ratatui::style::Style, Vec<ratatui::style::Style>) {
+        use crosswalk::ui::table::Table;
+        let theme = Theme::default();
+        let mut terminal = Terminal::new(TestBackend::new(150, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                Table::new(columns, rows, &theme).render(frame.buffer_mut(), area);
+            })
+            .unwrap();
+        let text = lines(&terminal);
+        let at = text[1]
+            .find(needle)
+            .unwrap_or_else(|| panic!("no {needle} in {}", text[1]));
+        let x = text[1][..at].chars().count();
+        let buffer = terminal.backend().buffer();
+        let style = |x: usize| buffer[(x as u16, 1)].style();
+        (style(x), (x + 1..x + needle.len()).map(style).collect())
+    }
+
+    #[test]
+    fn the_more_destinations_count_is_in_the_highlight_colour_live_or_idle() {
+        use crosswalk::ui::panes::{app_traffic_columns, app_traffic_zoom_columns};
+        let theme = Theme::default();
+        let mut idle = state();
+        idle.advance_time(Duration::from_secs(60));
+        for state in [state(), idle] {
+            let overview = app_traffic_rows(&state, &theme, "", &expanded(&[]), None, None);
+            let zoom = app_traffic_zoom_rows(&state, &theme, "", &expanded(&[]), None, None);
+            for (columns, rows) in [
+                (app_traffic_columns(), overview),
+                (app_traffic_zoom_columns(), zoom),
+            ] {
+                let (address, _) = drawn_styles(&columns, &rows, "203");
+                assert_ne!(address.fg, Some(theme.highlight));
+                let (plus, digit) = drawn_styles(&columns, &rows, "+2");
+                assert_eq!(plus.fg, Some(theme.highlight));
+                assert_eq!(digit[0].fg, Some(theme.highlight));
+                assert_eq!(address.bg, plus.bg);
+            }
+        }
+    }
+
+    #[test]
+    fn a_search_narrows_what_an_app_line_covers_and_lists() {
+        let state = state();
+        let theme = Theme::default();
+        let open = expanded(&["/usr/bin/chrome"]);
+        let rows = app_traffic_rows(&state, &theme, "52", &open, None, None);
+        assert_eq!(column(&rows, 2), ["203.0.113.2"]);
+        let rows = app_traffic_rows(&state, &theme, "203.0.113.", &open, None, None);
+        assert_eq!(rows.len(), 4);
+        let rows = app_traffic_rows(&state, &theme, "5228", &open, None, None);
+        assert_eq!(column(&rows, 2), ["203.0.113.2"]);
+        assert_eq!(rows[0].cells[8].text, "2.0 KB");
+        assert!(app_traffic_rows(&state, &theme, "nothing-here", &open, None, None).is_empty());
+    }
+
+    fn text_of_screen(state: &AppState, i: &mut Interaction, dns: Option<&ReverseDns>) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_interactive(frame, state, &Theme::default(), i, dns))
+            .unwrap();
+        lines(&terminal).join("\n")
+    }
+
+    /// chrome and wget, each to two destinations, and curl to one.
+    fn two_apps() -> AppState {
+        let mut state = AppState::new(StateLimits::default()).unwrap();
+        for (path, pid, first, second) in [
+            ("/usr/bin/chrome", 10, "203.0.113.1", "203.0.113.2"),
+            ("/usr/bin/wget", 11, "203.0.113.3", "203.0.113.4"),
+        ] {
+            let app = owner(path, pid);
+            send(&mut state, 1, &app, first, 443, 1_000);
+            send(&mut state, 1, &app, second, 443, 500);
+        }
+        send(
+            &mut state,
+            1,
+            &owner("/usr/bin/curl", 12),
+            "198.51.100.1",
+            80,
+            100,
+        );
+        state
+    }
+
+    #[test]
+    fn a_expands_the_selected_app_and_a_again_collapses_it() {
+        let state = two_apps();
+        let mut i = Interaction::default();
+        press(&mut i, &state, KeyCode::Char('2'));
+        press(&mut i, &state, KeyCode::Char('a'));
+        let text = text_of_screen(&state, &mut i, None);
+        assert!(text.contains("203.0.113.2"), "{text}");
+        assert!(!text.contains("203.0.113.4"), "{text}");
+        press(&mut i, &state, KeyCode::Char('a'));
+        let text = text_of_screen(&state, &mut i, None);
+        assert!(!text.contains("203.0.113.2"), "{text}");
+    }
+
+    #[test]
+    fn several_apps_stay_expanded_until_a_is_pressed_on_each() {
+        let state = two_apps();
+        let mut i = Interaction::default();
+        press(&mut i, &state, KeyCode::Char('2'));
+        press(&mut i, &state, KeyCode::Char('a'));
+        for _ in 0..3 {
+            press(&mut i, &state, KeyCode::Char('j'));
+        }
+        press(&mut i, &state, KeyCode::Char('a'));
+        let text = text_of_screen(&state, &mut i, None);
+        assert!(
+            text.contains("203.0.113.2") && text.contains("203.0.113.4"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_on_a_destination_collapses_its_app_alone_and_selects_the_apps_line() {
+        let state = two_apps();
+        let mut i = Interaction::default();
+        press(&mut i, &state, KeyCode::Char('2'));
+        press(&mut i, &state, KeyCode::Char('a'));
+        for _ in 0..3 {
+            press(&mut i, &state, KeyCode::Char('j'));
+        }
+        press(&mut i, &state, KeyCode::Char('a'));
+        press(&mut i, &state, KeyCode::Char('j'));
+        press(&mut i, &state, KeyCode::Char('j'));
+        press(&mut i, &state, KeyCode::Char('a'));
+        assert_eq!(i.selected(), 3);
+        let text = text_of_screen(&state, &mut i, None);
+        assert!(text.contains("203.0.113.2"), "{text}");
+        assert!(!text.contains("203.0.113.4"), "{text}");
+    }
+
+    #[test]
+    fn two_sandboxes_sharing_a_path_expand_and_collapse_apart() {
+        let mut state = AppState::new(StateLimits::default()).unwrap();
+        for (app_id, pid, first, second) in [
+            ("org.one.App", 10, "203.0.113.1", "203.0.113.2"),
+            ("org.two.App", 11, "203.0.113.3", "203.0.113.4"),
+        ] {
+            let mut app = owner("/app/bin/app", pid);
+            app.executable.flatpak_app = Some(app_id.to_owned());
+            send(&mut state, 1, &app, first, 443, 1_000);
+            send(&mut state, 1, &app, second, 443, 500);
+        }
+        let mut i = Interaction::default();
+        press(&mut i, &state, KeyCode::Char('2'));
+        press(&mut i, &state, KeyCode::Char('a'));
+        let text = text_of_screen(&state, &mut i, None);
+        assert!(text.contains("203.0.113.2"), "{text}");
+        assert!(!text.contains("203.0.113.4"), "{text}");
+    }
+
+    #[test]
+    fn a_on_an_app_with_one_destination_does_nothing() {
+        let state = two_apps();
+        let mut i = Interaction::default();
+        press(&mut i, &state, KeyCode::Char('2'));
+        press(&mut i, &state, KeyCode::Char('G'));
+        let before = text_of_screen(&state, &mut i, None);
+        press(&mut i, &state, KeyCode::Char('a'));
+        assert_eq!(text_of_screen(&state, &mut i, None), before);
+    }
+
+    #[test]
+    fn the_overview_and_zoom_share_which_apps_are_expanded() {
+        let state = two_apps();
+        let mut i = Interaction::default();
+        press(&mut i, &state, KeyCode::Char('2'));
+        press(&mut i, &state, KeyCode::Char('a'));
+        press(&mut i, &state, KeyCode::Enter);
+        assert!(text_of_screen(&state, &mut i, None).contains("203.0.113.2"));
+        press(&mut i, &state, KeyCode::Char('a'));
+        press(&mut i, &state, KeyCode::Esc);
+        assert!(!text_of_screen(&state, &mut i, None).contains("203.0.113.2"));
+    }
+
+    #[test]
+    fn a_on_another_pane_does_nothing() {
+        let state = two_apps();
+        let mut i = Interaction::default();
+        press(&mut i, &state, KeyCode::Char('3'));
+        press(&mut i, &state, KeyCode::Char('a'));
+        press(&mut i, &state, KeyCode::Char('2'));
+        assert!(!text_of_screen(&state, &mut i, None).contains("203.0.113.2"));
+    }
+
+    #[test]
+    fn a_search_matching_reverse_dns_names_expands_the_app_on_the_line() {
+        let state = two_apps();
+        let targets: [std::net::IpAddr; 2] = [
+            "203.0.113.3".parse().unwrap(),
+            "203.0.113.4".parse().unwrap(),
+        ];
+        let mut dns = ReverseDns::new(true, 8, 8, |address| {
+            (address.to_string().ends_with(".3") || address.to_string().ends_with(".4"))
+                .then(|| format!("host-{address}.cdn.example"))
+        });
+        dns.schedule_visible(targets);
+        for _ in 0..200 {
+            dns.poll();
+            if targets.iter().all(|t| dns.name(*t).is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut i = Interaction::with_names(true);
+        press(&mut i, &state, KeyCode::Char('2'));
+        press(&mut i, &state, KeyCode::Char('/'));
+        for c in "cdn.example".chars() {
+            press(&mut i, &state, KeyCode::Char(c));
+        }
+        press(&mut i, &state, KeyCode::Enter);
+        text_of_screen(&state, &mut i, Some(&dns));
+        press(&mut i, &state, KeyCode::Char('a'));
+        let text = text_of_screen(&state, &mut i, Some(&dns));
+        assert!(text.contains("host-203.0.113.4"), "{text}");
+    }
+
+    #[test]
+    fn an_app_whose_destinations_are_all_idle_is_muted() {
+        let theme = Theme::default();
+        let mut state = state();
+        assert_ne!(
+            app_traffic_rows(&state, &theme, "", &expanded(&[]), None, None)[0].style,
+            theme.muted()
+        );
+        state.advance_time(Duration::from_secs(200));
+        for rows in [
+            app_traffic_rows(&state, &theme, "", &expanded(&[]), None, None),
+            app_traffic_zoom_rows(&state, &theme, "", &expanded(&[]), None, None),
+        ] {
+            assert!(rows.iter().all(|r| r.style == theme.muted()));
+        }
+    }
+}
+
+mod desktop_names {
+    use super::*;
+    use crosswalk::{
+        desktop::DesktopNames,
+        ui::panes::{app_traffic_rows, app_traffic_zoom_rows, listening_rows, listening_zoom_rows},
+    };
+    use std::fs;
+
+    /// The table of one entry, `Browser Thing`, launching `/opt/web/webapp`, and
+    /// one for the Flatpak app `com.dropbox.Client`.
+    fn table() -> DesktopNames {
+        let folder =
+            std::env::temp_dir().join(format!("crosswalk-ui-desktop-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        for (file, name, exec) in [
+            ("web.desktop", "Browser Thing", "/opt/web/webapp"),
+            ("com.dropbox.Client.desktop", "Dropbox", "dropbox-launcher"),
+        ] {
+            let body = format!("[Desktop Entry]\nName={name}\nExec={exec}\n");
+            fs::write(folder.join(file), body).unwrap();
+        }
+        DesktopNames::load(&[folder], "")
+    }
+
+    fn app(path: &str, flatpak_app: Option<&str>) -> ProcessIdentity {
+        ProcessIdentity {
+            executable: ExecutableIdentity {
+                path: PathBuf::from(path),
+                flatpak_app: flatpak_app.map(str::to_owned),
+            },
+            pid: 7,
+            start_time: 1,
+            network_namespace: 7,
+        }
+    }
+
+    /// An app talking out, and listening on a port.
+    fn state_of(app: &ProcessIdentity) -> AppState {
+        let mut state = AppState::new(StateLimits::default()).unwrap();
+        let local = Endpoint {
+            ip: "192.0.2.10".parse().unwrap(),
+            port: Some(51_000),
+        };
+        state.record_traffic(
+            Duration::from_secs(1),
+            TrafficEvent {
+                source: local,
+                destination: Endpoint {
+                    ip: "203.0.113.9".parse().unwrap(),
+                    port: Some(443),
+                },
+                protocol: Protocol::Tcp,
+                direction: Direction::Outbound,
+                original_ip_bytes: 100,
+                limitation: None,
+                tcp_flags: None,
+                timing: None,
+            },
+            Some(app.clone()),
+        );
+        state.record_listeners(
+            vec![Listener {
+                protocol: Protocol::Tcp,
+                address: "0.0.0.0".parse().unwrap(),
+                port: 22,
+                owners: vec![app.clone()],
+            }],
+            32_768..=60_999,
+        );
+        state
+    }
+
+    fn app_cells(state: &AppState, names: &DesktopNames) -> [String; 4] {
+        let theme = Theme::default();
+        let open = all_expanded(state);
+        let names = Some(names);
+        [
+            app_traffic_rows(state, &theme, "", &open, None, names)[0].cells[1]
+                .text
+                .clone(),
+            app_traffic_zoom_rows(state, &theme, "", &open, None, names)[0].cells[1]
+                .text
+                .clone(),
+            listening_rows(state, &theme, "", names)[0].cells[0]
+                .text
+                .clone(),
+            listening_zoom_rows(state, &theme, "", names)[0].cells[0]
+                .text
+                .clone(),
+        ]
+    }
+
+    #[test]
+    fn the_overviews_and_listening_zoom_show_the_desktop_name_and_app_traffic_zoom_the_path() {
+        let state = state_of(&app("/opt/web/webapp", None));
+        let [overview, zoom, listening, listening_zoom] = app_cells(&state, &table());
+        assert_eq!(overview, "Browser Thing");
+        assert_eq!(zoom, "/opt/web/webapp");
+        assert_eq!(listening, "Browser Thing");
+        assert_eq!(listening_zoom, "Browser Thing");
+        let theme = Theme::default();
+        let path = &listening_zoom_rows(&state, &theme, "", Some(&table()))[0].cells[6];
+        assert_eq!(path.text, "/opt/web/webapp");
+    }
+
+    #[test]
+    fn a_flatpak_app_shows_the_name_of_its_app_id_entry() {
+        let state = state_of(&app("/app/bin/dropbox", Some("com.dropbox.Client")));
+        let [overview, zoom, listening, _] = app_cells(&state, &table());
+        assert_eq!(overview, "Dropbox");
+        assert_eq!(zoom, "/app/bin/dropbox");
+        assert_eq!(listening, "Dropbox");
+    }
+
+    #[test]
+    fn a_program_without_an_entry_shows_its_program_name() {
+        let claude = "/home/u/.local/share/claude/versions/2.1.296";
+        let state = state_of(&app(claude, None));
+        let [overview, zoom, listening, listening_zoom] = app_cells(&state, &table());
+        assert_eq!(overview, "claude");
+        assert_eq!(zoom, claude);
+        assert_eq!(listening, "claude");
+        assert_eq!(listening_zoom, "claude");
+    }
+
+    #[test]
+    fn both_searches_find_an_app_by_desktop_name_program_name_and_path() {
+        let state = state_of(&app("/opt/web/webapp", None));
+        let names = table();
+        let theme = Theme::default();
+        let open = all_expanded(&state);
+        for search in ["thing", "WEBAPP", "/opt/web"] {
+            let traffic = app_traffic_rows(&state, &theme, search, &open, None, Some(&names));
+            assert_eq!(traffic.len(), 1, "{search}");
+            let zoom = app_traffic_zoom_rows(&state, &theme, search, &open, None, Some(&names));
+            assert_eq!(zoom.len(), 1, "{search}");
+            assert_eq!(
+                listening_rows(&state, &theme, search, Some(&names)).len(),
+                1
+            );
+            assert_eq!(
+                listening_zoom_rows(&state, &theme, search, Some(&names)).len(),
+                1
+            );
+        }
+        let none = app_traffic_rows(&state, &theme, "nothing", &open, None, Some(&names));
+        assert!(none.is_empty());
+        assert!(listening_rows(&state, &theme, "nothing", Some(&names)).is_empty());
+    }
+
+    #[test]
+    fn a_name_wider_than_the_overview_column_is_cut_from_the_right() {
+        use crosswalk::ui::{panes::app_traffic_columns, table::Table};
+        let folder = std::env::temp_dir().join(format!("crosswalk-ui-wide-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let body = "[Desktop Entry]\nName=Visual Studio Code - Insiders\nExec=/opt/code/code\n";
+        fs::write(folder.join("code.desktop"), body).unwrap();
+        let names = DesktopNames::load(&[folder], "");
+        let state = state_of(&app("/opt/code/code", None));
+        let theme = Theme::default();
+        let rows = app_traffic_rows(
+            &state,
+            &theme,
+            "",
+            &all_expanded(&state),
+            None,
+            Some(&names),
+        );
+        let columns = app_traffic_columns();
+        let mut terminal = Terminal::new(TestBackend::new(140, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                Table::new(&columns, &rows, &theme).render(frame.buffer_mut(), area);
+            })
+            .unwrap();
+        let row = lines(&terminal)[1].clone();
+        assert!(row.contains("Visual Studio Code - Inside…"), "{row}");
+    }
+
+    #[test]
+    fn the_interaction_draws_apps_by_desktop_name() {
+        let state = state_of(&app("/opt/web/webapp", None));
+        let mut i = Interaction::default().with_desktop_names(table());
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        press(&mut i, &state, KeyCode::Char('2'));
+        terminal
+            .draw(|frame| draw_interactive(frame, &state, &Theme::default(), &mut i, None))
+            .unwrap();
+        assert!(lines(&terminal).join("\n").contains("Browser Thing"));
+    }
 }

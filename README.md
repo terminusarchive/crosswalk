@@ -1,6 +1,6 @@
 # Crosswalk
 
-Crosswalk shows what your Linux machine is doing on the network, live, in one terminal window.
+Crosswalk is a network monitoring TUI that aims to provide useful information about what is happening on your machine, live, in a single terminal window. 
 
 See how much bandwidth you are using, which apps are talking to which hosts, which ports are open and whether your firewall lets traffic reach them, what the firewall has blocked, and which machines and Wi-Fi networks are nearby. Switch between 25 built-in themes with one key.
 

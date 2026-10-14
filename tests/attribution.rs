@@ -66,6 +66,12 @@ impl ProcFixture {
         }
     }
 
+    fn flatpak_info(&self, pid: u32, text: &str) {
+        let root = self.root.join(pid.to_string()).join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".flatpak-info"), text).unwrap();
+    }
+
     fn remove_process(&self, pid: u32) {
         fs::remove_dir_all(self.root.join(pid.to_string())).unwrap();
     }
@@ -775,4 +781,33 @@ fn listeners_are_none_until_a_reading_has_succeeded() {
     .unwrap();
     collector.refresh(Duration::ZERO);
     assert_eq!(collector.listeners(), None);
+}
+
+#[test]
+fn a_process_in_a_flatpak_sandbox_carries_its_app_id() {
+    let fixture = ProcFixture::new(91);
+    let listening = socket_row_in_state("0100007F:1F90", NO_PEER4, "0A", 301);
+    fixture.write_table("tcp", &[&listening]);
+    fixture.process(400, 5, 91, "/app/bin/dropbox", &[301]);
+    fixture.flatpak_info(
+        400,
+        "[Application]\nname=com.dropbox.Client\nruntime=runtime/x\n\n[Instance]\nname=other\n",
+    );
+
+    let listeners = listeners_of(&fixture);
+
+    let app = listeners[0].owners[0].executable.flatpak_app.as_deref();
+    assert_eq!(app, Some("com.dropbox.Client"));
+}
+
+#[test]
+fn a_process_outside_a_sandbox_has_no_app_id() {
+    let fixture = ProcFixture::new(92);
+    let listening = socket_row_in_state("0100007F:1F90", NO_PEER4, "0A", 302);
+    fixture.write_table("tcp", &[&listening]);
+    fixture.process(401, 5, 92, "/usr/bin/web", &[302]);
+
+    let listeners = listeners_of(&fixture);
+
+    assert_eq!(listeners[0].owners[0].executable.flatpak_app, None);
 }

@@ -477,6 +477,7 @@ mod hold {
         ProcessIdentity {
             executable: ExecutableIdentity {
                 path: PathBuf::from("/opt/a"),
+                flatpak_app: None,
             },
             pid,
             start_time: 1,
